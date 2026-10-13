@@ -2,6 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::account::AccountError;
 use crate::error::OperatorError;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+use crate::operator::recovery::load_pending_sigs;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
 use crate::operator::{
     fetch_bitmap_generation, fetch_bitmap_if_present, fetch_consumed_nonces,
@@ -217,7 +218,8 @@ pub(crate) async fn release_seen_at_confirmed(
 }
 
 /// Boot check of released nonces, from the current generation up, against Completed rows.
-/// A set bit with no Completed row is repaired in place and boot continues.
+/// A set bit with no Completed row is repaired in place when a landed signature proves it,
+/// otherwise left to recovery or escalated, and boot continues unless the nonce was paid twice.
 /// A Completed row with a clear bit claims a release the chain never made, so boot refuses.
 pub(crate) async fn validate_bitmap_consistency(
     storage: &Storage,
@@ -413,36 +415,6 @@ async fn diff_bitmap(
     Ok((db_only, chain_only))
 }
 
-/// Read a withdrawal's broadcast signatures back from durable storage.
-///
-/// Every release persists its signature before broadcast, so this is the record
-/// that survives a restart. A read failure or an unparseable entry yields
-/// nothing, which routes callers to manual review rather than letting them
-/// conclude anything about whether the release landed.
-pub(super) async fn load_persisted_release_signatures(
-    storage: &Storage,
-    transaction_id: i64,
-) -> Vec<PendingSig> {
-    match storage.get_release_signatures(transaction_id).await {
-        Ok(stored) => stored
-            .iter()
-            .filter_map(|entry| {
-                Signature::from_str(&entry.signature)
-                    .ok()
-                    .map(|signature| PendingSig {
-                        signature,
-                        last_valid_block_height: entry.last_valid_block_height.max(0) as u64,
-                        blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
-                    })
-            })
-            .collect(),
-        Err(e) => {
-            error!(transaction_id, "Release signature lookup failed: {e}");
-            Vec::new()
-        }
-    }
-}
-
 /// What a chain-ahead nonce turned out to be, which decides whether startup
 /// can continue past it.
 ///
@@ -524,7 +496,19 @@ async fn resolve_chain_ahead_nonce(
         TransactionStatus::Processing | TransactionStatus::PendingRemint
     );
 
-    let signatures = load_persisted_release_signatures(storage, row.id).await;
+    // Like an unread row, an unread journal writes nothing; recovery re-reads it at runtime.
+    let signatures = match load_pending_sigs(storage, row.id).await {
+        Ok(signatures) => signatures,
+        Err(e) => {
+            error!(
+                nonce,
+                transaction_id = row.id,
+                "Release signature journal unusable, leaving the row as it is: {e}"
+            );
+            report_unrepaired(nonce);
+            return ChainAheadOutcome::Unrepaired;
+        }
+    };
 
     let verdict = if signatures.is_empty() {
         None
@@ -1761,6 +1745,173 @@ mod tests {
         let update = storage_rx.try_recv().expect("row must be escalated");
         assert_eq!(update.transaction_id, 7);
         assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    /// A journal that could not be read is not an empty journal: the row may be paid, so it
+    /// must stay Processing with no status written.
+    #[tokio::test]
+    async fn chain_ahead_nonce_with_unreadable_journal_leaves_the_row_untouched() {
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            2,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
+        );
+        mock.set_should_fail("get_release_signatures", true);
+
+        let state = make_sender_state(mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            2,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
+        assert!(storage_rx.try_recv().is_err(), "no status may be written");
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == 7)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Processing);
+    }
+
+    /// At the boot gate the same read failure starts and writes nothing, like an unread row.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_starts_without_a_write_when_the_journal_cannot_be_read() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
+
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            2,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
+        );
+        mock.set_should_fail("get_release_signatures", true);
+
+        let state = sender_state_with_storage(&server.url(), mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let result = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an unreadable journal must not block boot: {result:?}"
+        );
+        assert!(storage_rx.try_recv().is_err(), "no status may be written");
+    }
+
+    /// A journal read error on an earlier nonce must not stop a later double payout being found.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_double_payout_halts_despite_an_earlier_journal_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[2, 3]);
+
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            2,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
+        );
+        seed_withdrawal(&mock, 8, 3, TransactionStatus::FailedReminted, None);
+        mock.set_should_fail("get_release_signatures", true);
+
+        let state = sender_state_with_storage(&server.url(), mock);
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        let err = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            OperatorError::Program(crate::error::ProgramError::BitmapDivergence {
+                chain_only,
+                ..
+            }) => assert_eq!(chain_only, vec![3]),
+            other => panic!("expected BitmapDivergence, got: {other}"),
+        }
+    }
+
+    /// A journal entry that does not parse is corrupt, so the row is left for recovery to
+    /// quarantine rather than repaired from the entries that do parse.
+    #[tokio::test]
+    async fn chain_ahead_nonce_with_a_corrupt_journal_leaves_the_row_untouched() {
+        let transaction_id = 7;
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            transaction_id,
+            2,
+            TransactionStatus::Processing,
+            None,
+        );
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![
+                crate::storage::common::models::StoredSig {
+                    signature: "not-a-signature".to_string(),
+                    last_valid_block_height: 1,
+                    blockhash_slot: None,
+                },
+                crate::storage::common::models::StoredSig {
+                    signature: Signature::new_unique().to_string(),
+                    last_valid_block_height: 1,
+                    blockhash_slot: None,
+                },
+            ],
+        );
+
+        let state = make_sender_state(mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            2,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
+        assert!(storage_rx.try_recv().is_err(), "no status may be written");
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Processing);
     }
 
     /// A payout no signature accounts for is unexplained money leaving the instance, so it must not report as repaired.

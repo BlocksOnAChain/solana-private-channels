@@ -3,7 +3,8 @@ use super::types::InFlightQueue;
 use super::types::SenderState;
 use crate::config::ProgramType;
 use crate::metrics::{
-    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
+    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_PENDING_REMINTS, OPERATOR_RELEASE_VERIFY,
+    OPERATOR_REMINT_CLAIM_LOST,
 };
 use crate::operator::sender::{release_seen_at_confirmed, verify_release_landed, ReleaseVerdict};
 use crate::{
@@ -39,6 +40,12 @@ const MAX_FINALITY_CHECK_ATTEMPTS: u32 = 3;
 /// at one check per `FINALITY_SAFETY_DELAY`. Far above normal finality and indexer
 /// lag, but a wait that never clears still ends in ManualReview.
 const MAX_FREE_WAITS: u32 = 20;
+
+/// Cap on matured entries one tick processes, so a backlog cannot hold the sender loop.
+const MAX_REMINTS_PER_TICK: usize = 16;
+
+/// Time after which a tick starts no new entry, so slow RPC cannot hold the sender loop for long.
+const REMINT_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Outcome of a single `attempt_remint` call.
 enum RemintAttempt {
@@ -802,8 +809,8 @@ async fn classify_endpoint(
     }
 }
 
-/// Process matured entries in the deferred remint queue. For each matured
-/// entry, classify the stored withdrawal signatures and pick one of:
+/// Process up to `MAX_REMINTS_PER_TICK` matured entries in the deferred remint
+/// queue, starting none after `REMINT_TICK_BUDGET`. For each one, classify the stored withdrawal signatures and pick one of:
 ///   1. Any sig finalized + success → report Completed.
 ///   2. Any sig still live (has a non-finalized status entry, OR has no
 ///      status entry but still within blockhash validity)
@@ -817,6 +824,14 @@ pub async fn process_pending_remints(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
+    process_pending_remints_within(state, storage_tx, REMINT_TICK_BUDGET).await;
+}
+
+async fn process_pending_remints_within(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    budget: std::time::Duration,
+) {
     // Deferred remints are Withdraw-only; another role would classify the
     // release signatures against the wrong chain.
     if state.program_type != ProgramType::Withdraw {
@@ -825,7 +840,7 @@ pub async fn process_pending_remints(
 
     let now = Utc::now();
 
-    // Drain the queue and split: due now vs. wait longer.
+    // Drain the queue and split: due now vs. wait longer, then cap the due set.
     let mut remaining = Vec::new();
     let mut matured = Vec::new();
     for entry in state.pending_remints.drain(..) {
@@ -835,9 +850,21 @@ pub async fn process_pending_remints(
             remaining.push(entry);
         }
     }
+    // Keep the oldest deadlines in linear time; past the cap, entries wait unchanged for the next tick.
+    if matured.len() > MAX_REMINTS_PER_TICK {
+        matured.select_nth_unstable_by_key(MAX_REMINTS_PER_TICK, |entry| entry.deadline);
+        remaining.extend(matured.drain(MAX_REMINTS_PER_TICK..));
+    }
+    matured.sort_by_key(|entry| entry.deadline);
 
     // Each matured entry leaves the queue unless we push it back into `remaining`.
-    for mut entry in matured {
+    let started = std::time::Instant::now();
+    for (i, mut entry) in matured.into_iter().enumerate() {
+        // Past the budget the rest wait unchanged; the first entry always runs so the queue moves.
+        if i > 0 && started.elapsed() >= budget {
+            remaining.push(entry);
+            continue;
+        }
         let nonce_label = entry
             .ctx
             .withdrawal_nonce
@@ -976,6 +1003,9 @@ pub async fn process_pending_remints(
     // `remaining` = entries not yet due + entries re-queued by `defer_or_escalate`
     // or `requeue_in_flight`.
     state.pending_remints = remaining;
+    OPERATOR_PENDING_REMINTS
+        .with_label_values(&[state.program_type.as_label()])
+        .set(state.pending_remints.len() as f64);
 }
 
 /// What the chain can tell us about a nonce at the instant before a remint.
@@ -1610,6 +1640,39 @@ mod tests {
         (state, mock)
     }
 
+    /// A withdrawal remint entry due at `deadline`, with two journaled signatures.
+    fn matured_entry(id: i64, nonce: u64, deadline: chrono::DateTime<Utc>) -> PendingRemint {
+        PendingRemint {
+            ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
+                transaction_id: Some(id),
+                withdrawal_nonce: Some(nonce),
+                trace_id: Some(format!("trace-{id}")),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(id),
+            signatures: vec![
+                PendingSig {
+                    signature: Signature::new_unique(),
+                    last_valid_block_height: 0,
+                    blockhash_slot: None,
+                },
+                PendingSig {
+                    signature: Signature::new_unique(),
+                    last_valid_block_height: 0,
+                    blockhash_slot: None,
+                },
+            ],
+            original_error: "release_funds failed".to_string(),
+            deadline,
+            finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
+        }
+    }
+
     /// Register a mockito response for a specific Solana RPC method.
     async fn mock_rpc(server: &mut mockito::Server, method: &str, body: &str) -> mockito::Mock {
         server
@@ -1997,6 +2060,112 @@ mod tests {
             state.pending_remints.is_empty(),
             "should not re-queue after max attempts"
         );
+    }
+
+    /// One tick handles at most the cap, oldest deadline first, and leaves the overflow
+    /// untouched for the next tick.
+    #[tokio::test]
+    async fn process_pending_remints_handles_at_most_the_cap_per_tick() {
+        let mut server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(64);
+        // Fewer statuses than signatures makes every entry Uncertain, so each one defers.
+        let _status = mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_rpc(
+            &mut server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        let total = MAX_REMINTS_PER_TICK + 1;
+        let base = Utc::now() - chrono::Duration::seconds(600);
+        for i in 0..total {
+            let id = 100 + i as i64;
+            seed_pending_remint_row(&mock, id, 0);
+            // Pushed newest first so the cap has to pick by deadline, not by position.
+            let deadline = base + chrono::Duration::seconds((total - i) as i64);
+            state
+                .pending_remints
+                .push(matured_entry(id, id as u64, deadline));
+        }
+        let newest_id = 100;
+        let newest_deadline = state.pending_remints[0].deadline;
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(storage_rx.try_recv().is_err(), "deferrals write no status");
+        assert_eq!(state.pending_remints.len(), total);
+        let handled = state
+            .pending_remints
+            .iter()
+            .filter(|e| e.finality_check_attempts == 1)
+            .count();
+        assert_eq!(handled, MAX_REMINTS_PER_TICK);
+        let leftover = state
+            .pending_remints
+            .iter()
+            .find(|e| e.ctx.transaction_id == Some(newest_id))
+            .expect("leftover stays queued");
+        assert_eq!(leftover.finality_check_attempts, 0);
+        assert_eq!(leftover.deadline, newest_deadline);
+
+        // The re-queued entries are no longer due, so the leftover goes next tick.
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let leftover = state
+            .pending_remints
+            .iter()
+            .find(|e| e.ctx.transaction_id == Some(newest_id))
+            .expect("leftover stays queued");
+        assert_eq!(leftover.finality_check_attempts, 1);
+    }
+
+    /// Once the time budget is spent no new entry starts, but the oldest one always runs.
+    #[tokio::test]
+    async fn process_pending_remints_starts_no_entry_past_the_time_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        let (storage_tx, _storage_rx) = mpsc::channel(64);
+        let _status = mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_rpc(
+            &mut server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        let base = Utc::now() - chrono::Duration::seconds(600);
+        for i in 0..3i64 {
+            let id = 100 + i;
+            seed_pending_remint_row(&mock, id, 0);
+            let deadline = base + chrono::Duration::seconds(3 - i);
+            state
+                .pending_remints
+                .push(matured_entry(id, id as u64, deadline));
+        }
+        let oldest_id = 102;
+
+        process_pending_remints_within(&mut state, &storage_tx, std::time::Duration::ZERO).await;
+
+        assert_eq!(state.pending_remints.len(), 3);
+        let handled: Vec<_> = state
+            .pending_remints
+            .iter()
+            .filter(|e| e.finality_check_attempts == 1)
+            .map(|e| e.ctx.transaction_id)
+            .collect();
+        assert_eq!(handled, vec![Some(oldest_id)]);
     }
 
     /// When the pending_remints queue contains both matured entries (deadline

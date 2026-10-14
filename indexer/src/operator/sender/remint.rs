@@ -4,7 +4,7 @@ use super::types::SenderState;
 use crate::config::ProgramType;
 use crate::metrics::{
     OPERATOR_ABSENCE_CLASSIFY, OPERATOR_PENDING_REMINTS, OPERATOR_RELEASE_VERIFY,
-    OPERATOR_REMINT_CLAIM_LOST,
+    OPERATOR_REMINT_CLAIM_LOST, OPERATOR_TRANSACTION_ERRORS,
 };
 use crate::operator::sender::{release_seen_at_confirmed, verify_release_landed, ReleaseVerdict};
 use crate::{
@@ -46,6 +46,9 @@ const MAX_REMINTS_PER_TICK: usize = 16;
 
 /// Time after which a tick starts no new entry, so slow RPC cannot hold the sender loop for long.
 const REMINT_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Rows loaded per page of the durable backlog, so memory stays bounded at boot and after.
+pub(super) const REMINT_HYDRATE_PAGE: usize = 256;
 
 /// Outcome of a single `attempt_remint` call.
 enum RemintAttempt {
@@ -838,6 +841,21 @@ async fn process_pending_remints_within(
         return;
     }
 
+    // Top up from the durable backlog. A read error must not stop the sender loop, and the
+    // cursor only moves on success, so the next tick retries the same page.
+    if state.queued_backlog_remints() < REMINT_HYDRATE_PAGE {
+        if let Err(e) = state.hydrate_pending_remints(storage_tx).await {
+            // Counted so a read that keeps failing raises an alert instead of stalling refunds quietly.
+            OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    state.program_type.as_label(),
+                    "pending_remint_page_read_failed",
+                ])
+                .inc();
+            error!("Pending remint page read failed, retrying next tick: {e}");
+        }
+    }
+
     let now = Utc::now();
 
     // Drain the queue and split: due now vs. wait longer, then cap the due set.
@@ -1005,7 +1023,7 @@ async fn process_pending_remints_within(
     state.pending_remints = remaining;
     OPERATOR_PENDING_REMINTS
         .with_label_values(&[state.program_type.as_label()])
-        .set(state.pending_remints.len() as f64);
+        .set(state.remint_backlog_size() as f64);
 }
 
 /// What the chain can tell us about a nonce at the instant before a remint.
@@ -1494,6 +1512,9 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1634,6 +1655,9 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1734,6 +1758,9 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };

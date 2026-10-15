@@ -716,7 +716,9 @@ async fn seed_pending_deposit(db_url: &str, signature: &str) {
 }
 
 /// Slot of every seeded row: above any slot a test validator reaches, so a seed never sits
-/// below the genesis a test resyncs from.
+/// below the genesis a test resyncs from. A resync refuses a row above its tip as soon as the
+/// tip is known, so a test whose resync gets past that point moves its seed into the replay
+/// range first.
 const SEED_SLOT: i64 = 1_000_000_000;
 
 /// Insert one row of `ty` in `status`; a withdrawal takes its nonce from the sequence.
@@ -1062,10 +1064,20 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         .await?;
     }
 
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
     };
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_sig_001'"
+        ),
+    )
+    .await;
 
     seed_withdrawal_side(&db_url).await;
     let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
@@ -1915,6 +1927,15 @@ async fn resync_aborts_on_signed_mint_that_does_not_pay_the_deposit_db_intact(
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
+    // Inside the replay range, or the tip check would refuse before the mismatch is found.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {} WHERE signature = '{sentinel_signature}'",
+            h.genesis
+        ),
+    )
+    .await;
     let rows_before = row_count(&db_url).await;
 
     let result = h.run().await;
@@ -2016,6 +2037,15 @@ async fn resync_aborts_on_remint_marker_for_a_deposit_db_intact(
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_kind_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
+    // Inside the replay range, or the tip check would refuse before the mismatch is found.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {} WHERE signature = '{sentinel_signature}'",
+            h.genesis
+        ),
+    )
+    .await;
     let rows_before = row_count(&db_url).await;
 
     let result = h.run().await;
@@ -2062,7 +2092,8 @@ async fn resync_reclassifies_failed_reminted_withdrawal() -> Result<(), Box<dyn 
         validator.rpc_url(),
         CommitmentConfig::confirmed(),
     ));
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("resync_reminted_withdrawal").await?;
 
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
@@ -2131,7 +2162,8 @@ async fn resync_leaves_released_withdrawal_for_smt_guard() -> Result<(), Box<dyn
         validator.rpc_url(),
         CommitmentConfig::confirmed(),
     ));
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("resync_released_withdrawal").await?;
 
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
@@ -2318,6 +2350,15 @@ async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error:
         script_channel_floor(&mock);
         let sentinel = format!("rotation_sentinel_{}", &case[..1]);
         seed_pending_deposit(&db_url, &sentinel).await;
+        // Inside the replay range, since a refused case leaves it for the next discovery.
+        seed_sql(
+            &db_url,
+            &format!(
+                "UPDATE transactions SET slot = {} WHERE signature = '{sentinel}'",
+                h.genesis
+            ),
+        )
+        .await;
         let rows_before = row_count(&db_url).await;
         let status_before = status_of(&db_url, &dep).await.status;
 
@@ -2375,7 +2416,8 @@ async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error:
         program_type: ProgramType::Withdraw,
         instance: Some(env.instance),
         channel_url: mock.url(),
-        genesis,
+        // A withdraw resync replays from slot 0.
+        genesis: 0,
     };
     let wd = keys_of_type(&h.discover().await, "withdrawal")[0].clone();
     let memo = memo_for(&wd.source_event_id(), ConsumedMintKind::Remint);
@@ -2499,6 +2541,14 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
         let (db_url, storage, _pg) =
             start_postgres_for_resync(&format!("resync_pruned_{i}")).await?;
         seed_pending_deposit(&db_url, "resync_pruned_seed").await;
+        // Inside the replay range, or the tip check would refuse before the late floor read.
+        seed_sql(
+            &db_url,
+            &format!(
+                "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_pruned_seed'"
+            ),
+        )
+        .await;
 
         let mock = MockRpcServer::start().await;
         script_channel_caught_up(&mock);
@@ -2719,10 +2769,20 @@ async fn resync_refuses_while_a_worker_holds_the_live_lock(
         })
         .await?,
     ));
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
     };
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_live_lock_seed'"
+        ),
+    )
+    .await;
     let service = make_resync_service(rpc_url, storage);
     run_resync(&service, current_slot)
         .await
@@ -2780,6 +2840,8 @@ async fn resync_initializes_schema_on_a_fresh_database() -> Result<(), Box<dyn s
     let rpc_url = test_validator.rpc_url();
     let (db_url, storage, _container) = start_bare_postgres_for_resync("resync_fresh_db").await?;
 
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
@@ -2849,6 +2911,14 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
     // Recent slots only, so every block is retrievable, and one round trip per slot
     // so the fill is long enough to still be running when the lock goes.
     let genesis_slot = current_slot.saturating_sub(BACKFILL_SPAN_SLOTS);
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {genesis_slot} WHERE signature = 'resync_lock_lost_seed'"
+        ),
+    )
+    .await;
 
     let rpc_poller = Arc::new(RpcPoller::new(
         rpc_url.clone(),
@@ -2935,13 +3005,10 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
         Err(StorageError::UnfinishedResync { .. })
     ));
 
-    // A rerun of the same program finishes the rebuild and clears it.
-    let current_slot = {
-        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
-        client.get_slot()?
-    };
+    // A rerun of the same program finishes the rebuild and clears it. It starts from the same
+    // genesis, since the marker keeps the deleted seed's slot as the lowest a rerun may use.
     let rerun = make_resync_service(rpc_url, new_storage(&db_url).await);
-    run_resync(&rerun, current_slot)
+    run_resync(&rerun, genesis_slot)
         .await
         .expect("a same-program rerun must finish the interrupted resync");
     assert_eq!(marker(&db_url).await, None);
@@ -2990,6 +3057,7 @@ enum Refusal {
     ReleaseEvidence,
     OtherMarker,
     GenesisAboveRows,
+    WithdrawGenesis,
 }
 
 /// The unsafe state a refusal case starts from, so each case carries its own setup.
@@ -3005,6 +3073,8 @@ enum Seed {
     OtherMarker,
     /// One row of this type in this status at this slot.
     TxAt(&'static str, &'static str, i64),
+    /// Nothing at all: an empty or lost database.
+    Empty,
 }
 
 struct RefusalCase {
@@ -3043,6 +3113,7 @@ async fn seed_refusal(db_url: &str, seed: Seed) {
             )
             .await;
         }
+        Seed::Empty => {}
     }
 }
 
@@ -3127,7 +3198,15 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
             program: ProgramType::Withdraw,
             seed: Seed::TxAt("withdrawal", "pending", 100),
             genesis: 101,
-            expected: Refusal::GenesisAboveRows,
+            // The genesis-0 rule answers first, so the operator is not sent to 100 and refused again.
+            expected: Refusal::WithdrawGenesis,
+        },
+        RefusalCase {
+            name: "withdraw: empty table, genesis above 0",
+            program: ProgramType::Withdraw,
+            seed: Seed::Empty,
+            genesis: 1,
+            expected: Refusal::WithdrawGenesis,
         },
     ];
     for RefusalCase {
@@ -3167,6 +3246,9 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
                 genesis_slot: 101,
                 earliest_slot: 100,
             })) => Refusal::GenesisAboveRows,
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawGenesisNotZero {
+                ..
+            })) => Refusal::WithdrawGenesis,
             other => panic!("{case}: expected {expected:?}, got {other:?}"),
         };
         assert_eq!(got, expected, "{case}");
@@ -4242,7 +4324,8 @@ async fn e2e_interrupted_withdraw_resync_reruns_cleanly() -> Result<(), Box<dyn 
     let (validator, faucet) = start_test_validator_no_geyser().await;
     let rpc_url = validator.rpc_url();
     let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_interrupted_withdraw").await?;
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
     let user = &env.users[0];

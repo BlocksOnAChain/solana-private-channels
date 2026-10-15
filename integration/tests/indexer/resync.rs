@@ -922,6 +922,31 @@ async fn do_deposit(
     helpers::send_and_confirm_instructions(client, &[ix], user, &[user], "Deposit").await
 }
 
+/// Moves all but `keep` of the user's tokens into escrow custody with a plain transfer. This
+/// harness plays the channel on the same validator, so every token outside custody reads as
+/// channel supply; a restarted escrow operator opens its solvency fence only once that matches.
+async fn top_up_custody_to_supply(
+    client: &RpcClient,
+    user: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    keep: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let amount = token_balance(client, user.pubkey(), mint).await - keep;
+    let ix = spl_token::instruction::transfer(
+        &TOKEN_PROGRAM_ID,
+        &get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID),
+        &get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_PROGRAM_ID),
+        &user.pubkey(),
+        &[],
+        amount,
+    )?;
+    helpers::send_and_confirm_instructions(client, &[ix], user, &[user], "TopUpCustody").await?;
+    // Custody is read at finalized, so the restart must not see the balance before the move.
+    wait_for_finalized_slot(&client.url(), client.get_slot().await? + 1).await;
+    Ok(())
+}
+
 /// Two Deposit instructions in ONE transaction (same signature, distinct
 /// instruction/inner index): the identity-granularity fixture for IT-R10.
 async fn do_double_deposit(
@@ -3236,7 +3261,9 @@ impl Stack {
     /// updated"), which is a startup artefact of this harness, not of the resync.
     async fn start(rpc_url: &str, db_url: &str, instance: Pubkey) -> Self {
         let (rpc, db) = (rpc_url.to_string(), db_url.to_string());
-        let channel = ChannelShim::start(rpc_url).await;
+        // The channel is this validator, so every token outside custody would read as unbacked
+        // channel supply; mirror custody so the escrow operator's solvency fence can open.
+        let channel = ChannelShim::start_mirroring_custody(rpc_url, instance).await;
         let mut workers = Vec::new();
         {
             let (rpc, db) = (rpc.clone(), db.clone());
@@ -3261,11 +3288,11 @@ impl Stack {
             );
         }
         {
-            let (rpc, db) = (channel.url(), db.clone());
+            let (channel_rpc, rpc, db) = (channel.url(), rpc.clone(), db.clone());
             workers.push(
                 Worker::spawn(move || async move {
                     start_solana_to_private_channel_operator_with_config(
-                        rpc.clone(),
+                        channel_rpc,
                         rpc,
                         db,
                         admin(),
@@ -4171,15 +4198,18 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
     assert_eq!(deposit_outcomes(&db_url).await, deposits);
 
     // The workers run normally again: one new deposit is minted once and nothing else is.
+    // Its amount stays inside the reconciliation tolerance of the topped-up custody.
+    let late_deposit = 1_000;
+    top_up_custody_to_supply(&client, user, env.instance, env.mint, late_deposit).await?;
     let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
-    let deposit_c = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    let deposit_c = do_deposit(&client, user, env.instance, env.mint, late_deposit).await?;
     wait_for_status(&db_url, &deposit_c.to_string(), "completed").await;
     let_stack_settle(&db_url, &client).await;
     stack.stop().await;
     assert_eq!(deposit_count(&db_url).await, 3, "no duplicate deposit rows");
     assert_eq!(
         supply(&client, env.mint).await,
-        supply_before + DEPOSIT_AMOUNT,
+        supply_before + late_deposit,
         "only the new deposit is minted"
     );
     Ok(())

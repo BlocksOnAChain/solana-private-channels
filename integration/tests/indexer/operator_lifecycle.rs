@@ -84,7 +84,10 @@ async fn seed_mint_status_allowed(
     Ok(())
 }
 
-/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the operator claims it.
+/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the
+/// operator claims it and the custody slot before its solvency fence opens. The write only
+/// moves forward. A test that also runs a withdraw processor keeps it within reach of the
+/// chain, since that processor anchors its allowlist read at the checkpoint.
 async fn seed_escrow_checkpoint(
     storage: &Storage,
     slot: u64,
@@ -424,7 +427,18 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .build();
 
     storage.insert_db_transaction(&deposit_txn).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        amount,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // 3. Start a PrivateChannel core node as the mint target. It reports every
     // found transaction as `finalized` instantly, so the operator's finalized
@@ -521,7 +535,18 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .transaction_type(TransactionType::Deposit)
         .build();
     storage.insert_db_transaction(&deposit_txn).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        amount,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Duplicate insert with same signature should not create a second mint.
     storage.insert_db_transaction(&deposit_txn).await?;
@@ -762,12 +787,46 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     .transaction_type(TransactionType::Deposit)
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        bad_mint.pubkey(),
+        env.instance,
+        &bad_authority,
+        10_000,
+    )
+    .await?;
+    // The fence opens only on a tick whose custody slot the checkpoint covers, and the withdraw
+    // processor later anchors its allowlist read at the checkpoint, so it can sit neither
+    // behind the chain nor far ahead of it: keep it a few slots ahead until the mint is claimed.
+    let last_seeded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reseed = {
+        let storage = storage.clone();
+        let last_seeded = last_seeded.clone();
+        let client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(slot) = client.get_slot().await {
+                    let _ = seed_escrow_checkpoint(&storage, slot + 5).await;
+                    last_seeded.store(slot + 5, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    };
 
     // A write-ahead-persisted mint is never terminalized in the sender: the send
     // error leaves the row Processing for recovery to reconcile against the
     // persisted signature, so it journals its signature and never reaches Failed.
     wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
+    reseed.abort();
+    // The withdraw processor anchors its allowlist read at the checkpoint with a few quick
+    // retries, so let the chain pass the last seed before any withdrawal is offered.
+    while client.get_slot().await? < last_seeded.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let mint_row = db::get_transaction(&pool, &mint_fail_sig)
         .await?
         .expect("the deposit row must exist");
@@ -911,7 +970,18 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         storage.insert_db_transaction(&txn).await?;
         signatures.push(sig);
     }
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The rows stand in for deposits, so custody must hold what they say was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        DEPOSIT_AMOUNT * NUM_USERS as u64,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Start the Solana -> PrivateChannel operator and wait for all deposits to be processed.
     // The mint target is a PrivateChannel node (instant finality), so balances
@@ -1084,7 +1154,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     mint_to_owner(&client, &admin, mint, holder.pubkey(), &admin, OVER_ISSUED).await?;
 
     // One active (pending) withdrawal so the halt's quarantine has a row to flip.
-    // Its amount joins the mint's in-flight envelope but stays well under the gap.
+    // A withdrawal never widens the envelope, since its burn is already in the supply.
     let wd_sig = Signature::new_unique().to_string();
     let withdrawal =
         DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
@@ -1132,6 +1202,8 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 
     let cancellation_token = CancellationToken::new();
     let recon_token_clone = cancellation_token.clone();
+    let fence = private_channel_indexer::operator::solvency_fence::SolvencyFence::closed();
+    let recon_fence = fence.clone();
     let recon_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = run_reconciliation(
             recon_storage,
@@ -1141,6 +1213,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
             instance,
             health_for_task,
             recon_token_clone,
+            recon_fence,
         )
         .await
         {
@@ -1185,6 +1258,15 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     assert!(
         !health.is_healthy(),
         "operator health must be forced unhealthy after a halt"
+    );
+    // The in-process fence tripped too, so this process moves nothing even without the row.
+    assert!(
+        !fence.is_open(),
+        "a confirmed breach trips the solvency fence"
+    );
+    assert_eq!(
+        fence.state(),
+        private_channel_indexer::operator::solvency_fence::FenceState::Tripped
     );
 
     // The active withdrawal was quarantined to manual_review by the halt.

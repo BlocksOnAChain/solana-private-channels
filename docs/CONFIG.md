@@ -30,7 +30,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 channel admin pubkeys, gating SPL `InitializeMint`, `MintTo`, `MintToChecked`, `FreezeAccount`, `ThawAccount`, mint-side `SetAuthority` and the withdraw program's `SetWithdrawConfig`. Not the escrow `Instance.admin`, which is a separate offline key |
 | `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string. Must be PostgreSQL: Redis is a cache, never the accounts database |
 | `--redis-cache-url` | `PRIVATE_CHANNEL_REDIS_CACHE_URL` | — | Optional Redis cache in front of the read path. Misses resolve against PostgreSQL |
-| `--redis-block-ttl-secs` | `PRIVATE_CHANNEL_REDIS_BLOCK_TTL_SECS` | `3600` | Expiry on cached `block:{slot}` entries, bounding cache growth. PostgreSQL is the source of truth, so an expired entry is a miss that re-reads. `0` disables it |
+| `--redis-block-ttl-secs` | `PRIVATE_CHANNEL_REDIS_BLOCK_TTL_SECS` | `3600` | Expiry on cached `block:{slot}` and `tx:{signature}` entries, bounding cache growth. PostgreSQL is the source of truth, so an expired entry is a miss that re-reads. `0` disables it |
 | `--log-level` | `PRIVATE_CHANNEL_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `--json-logs` | `PRIVATE_CHANNEL_JSON_LOGS` | `false` | Structured JSON log output |
 | `--perf-sample-period-secs` | `PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS` | `60` | Performance metrics sampling interval |
@@ -172,7 +172,7 @@ private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump \
 Nothing is deleted, not even in a dry run, until the dump is proven to hold every
 row the run would delete. The proof reads the whole dump once through `pg_restore`
 and requires: a clean exit with nothing on stderr, data for `blocks`,
-`transactions`, `metadata` (and `account_history` if present), the live
+`transactions`, `address_signatures`, `metadata` (and `account_history` if present), the live
 database's `deployment_id`, and exactly the live number of blocks and
 `account_history` rows below the cutoff. The report prints the dump's SHA-256 so it
 can be matched against the backup you keep. WAL archiving and file age are not
@@ -188,7 +188,10 @@ accepted as proof.
 
 Truncation deletes in batches, and each batch commits the new retention floor
 (`getFirstAvailableBlock`) in the same transaction as its deletions. A partial or
-aborted run therefore never advertises history it has already removed.
+aborted run therefore never advertises history it has already removed. Each batch
+also deletes the `address_signatures` rows of the transactions it removes, so the
+dump must hold that table too. Rows left by truncations run before this change stay
+until removed once by hand: `DELETE FROM address_signatures WHERE slot < <getFirstAvailableBlock>;`
 
 **Truncation always keeps `2 x max_blockhashes` blocks.** `--keep-slots` is a
 slot span, but `truncate` refuses, dry runs included, any cut that leaves fewer

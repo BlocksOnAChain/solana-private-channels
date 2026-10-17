@@ -13,12 +13,12 @@
 //! reduce the ATA balance.
 //!
 //! Flow:
-//! 1. Sweep the escrow instance's on-chain token accounts, summed per mint, noting the
-//!    slot the reading is valid as of.
+//! 1. Sweep the escrow instance's on-chain ATA of each allowed mint, noting the slot the
+//!    reading is valid as of.
 //! 2. Query the DB for per-mint aggregate balances (all deposits - released
 //!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
-//! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
+//! 4. If any mint's channel supply exceeds its custody by more than its tolerance, log
 //!    error, emit alert, abort startup. Checked first: it reads the chain on both sides,
 //!    so it is unaffected by how far behind the DB is and can never be repaired by
 //!    indexing more slots. A supply that cannot be read at all aborts too, since an
@@ -31,23 +31,28 @@
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
-    error::{IndexerError, ReconciliationError},
+    error::{IndexerError, ReconciliationError, StorageError},
     indexer::checkpoint::program_key,
     operator::{
         escrow_sweep::{
             fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot, SweepFailure,
         },
-        reconciliation::insolvency_tolerance_raw,
+        reconciliation::{insolvency_tolerance_raw, wait_for_ledger, LedgerWait},
         rpc_util::RpcClientWithRetry,
         RetryConfig,
     },
     storage::common::amount::{net_to_u64, NetBalance},
     storage::common::models::MintDbBalance,
+    storage::common::storage::live_lock::{
+        under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
+    },
     storage::Storage,
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// What this boot tolerates for one mint: the absolute floor, or the same relative cushion
@@ -185,7 +190,7 @@ pub async fn reconcile_against_snapshot(
     snapshot: &CustodySnapshot,
 ) -> Result<(), IndexerError> {
     if program_type != ProgramType::Escrow {
-        info!("Startup reconciliation skipped (program_type is not Escrow)");
+        info!("Reconciliation skipped (program_type is not Escrow)");
         return Ok(());
     }
 
@@ -201,7 +206,7 @@ pub async fn reconcile_against_snapshot(
     info!(
         instance_pda = %instance_pda,
         snapshot_slot = snapshot.slot,
-        "Running startup reconciliation"
+        "Running reconciliation"
     );
 
     // Snapshot of any deposit rows whose mint never had an `AllowMint` row.
@@ -269,6 +274,68 @@ pub async fn reconcile_against_snapshot(
     classify_and_report(config, &results)?;
 
     Ok(())
+}
+
+/// Metric label for the live-state lock a manual reconciliation holds.
+const RECONCILE_LOCK_ROLE: &str = "reconcile";
+
+/// One read-only reconciliation for an operator: capture custody, wait for the escrow
+/// ledger to cover that slot, then compare. A ledger that never gets there is reported,
+/// never compared, so status cannot stand in for a release the indexer has not recorded.
+/// The live-state lock is held shared throughout, so a resync cannot delete the ledger
+/// between the coverage wait and the comparison.
+pub async fn run_manual_reconciliation(
+    config: &ReconciliationConfig,
+    storage: &Arc<Storage>,
+    rpc_url: &str,
+    channel_rpc_url: Option<&str>,
+    instance_pda: &Pubkey,
+) -> Result<(), IndexerError> {
+    let live_lock_lost = CancellationToken::new();
+    let live_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            RECONCILE_LOCK_ROLE,
+            live_lock_lost.clone(),
+            LIVE_LOCK_HEARTBEAT_INTERVAL,
+        )
+        .await?;
+    let verdict = under_live_lock(&live_lock_lost, async {
+        // A resync that deleted rows and died no longer holds the lock; its marker is what
+        // stops us.
+        storage.ensure_no_unfinished_resync().await?;
+        let snapshot = capture_custody_snapshot(rpc_url, instance_pda).await?;
+        match wait_for_ledger(storage, snapshot.slot, &CancellationToken::new()).await {
+            LedgerWait::Covered => {}
+            LedgerWait::Unknown => {
+                return Err(ReconciliationError::LedgerCoverageIncomplete {
+                    snapshot_slot: snapshot.slot,
+                }
+                .into())
+            }
+            // Nothing cancels this token, so only an unreadable checkpoint lands here.
+            LedgerWait::Unreadable | LedgerWait::Cancelled => {
+                return Err(ReconciliationError::Storage(StorageError::DatabaseError {
+                    message: "the escrow checkpoint could not be read".to_string(),
+                })
+                .into())
+            }
+        }
+        reconcile_against_snapshot(
+            config,
+            ProgramType::Escrow,
+            storage,
+            rpc_url,
+            channel_rpc_url,
+            instance_pda,
+            &snapshot,
+        )
+        .await
+    })
+    .await;
+    // The heartbeat notices a loss late, so prove the lock held through the comparison.
+    live_lock.ensure_held().await?;
+    verdict
 }
 
 /// Readings a supply breach must appear in, consecutively, before it is believed.
@@ -344,7 +411,7 @@ async fn measure_supply_breaches(
                 warn!(
                     mint = %r.mint,
                     reason = %e.reason,
-                    "Startup supply invariant: channel supply read failed"
+                    "Supply invariant: channel supply read failed"
                 );
             }
         }
@@ -363,7 +430,7 @@ async fn measure_supply_breaches(
     for (r, mint, supply) in supplies {
         let on_chain_custody = custody.balances.get(&mint).copied().unwrap_or(0);
         let gap = supply.saturating_sub(on_chain_custody);
-        if gap > config.mismatch_threshold_raw {
+        if gap > startup_tolerance_raw(config, on_chain_custody) {
             breaches.push(SupplyBreach {
                 mint: r.mint.clone(),
                 key: mint,
@@ -466,7 +533,7 @@ async fn check_channel_supply_invariant(
                 round,
                 required = SUPPLY_BREACH_CONFIRMATIONS,
                 unresolved = unresolved_count,
-                "Startup supply invariant: possible breach, re-reading before acting on it"
+                "Supply invariant: possible breach, re-reading before acting on it"
             );
             tokio::time::sleep(std::time::Duration::from_millis(
                 SUPPLY_BREACH_RECHECK_DELAY_MS,
@@ -486,6 +553,7 @@ async fn check_channel_supply_invariant(
             custody_slot = b.custody_slot,
             gap = b.gap,
             threshold = config.mismatch_threshold_raw,
+            tolerance = startup_tolerance_raw(config, b.custody),
             readings,
             required = SUPPLY_BREACH_CONFIRMATIONS,
             "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
@@ -554,18 +622,15 @@ async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
             error!(
                 row_count = orphans.len(),
                 orphan_ids = ?orphans,
-                "Startup reconciliation: orphan deposit row(s) present (deposit rows with \
-                 no allowed mint status at the deposit's slot) — surfaced for visibility, does not fail startup"
+                "Reconciliation: orphan deposit row(s) present (deposit rows with \
+                 no allowed mint status at the deposit's slot); surfaced for visibility, does not fail reconciliation"
             );
         }
         Ok(_) => {
-            info!("Startup reconciliation: no orphan deposit rows");
+            info!("Reconciliation: no orphan deposit rows");
         }
         Err(e) => {
-            warn!(
-                "Startup reconciliation: failed to query orphan deposit ids: {}",
-                e
-            );
+            warn!("Reconciliation: failed to query orphan deposit ids: {}", e);
         }
     }
 }
@@ -646,7 +711,7 @@ fn classify_and_report(
             db_expected = r.db_expected,
             on_chain_actual = r.on_chain_actual,
             surplus = r.surplus(),
-            "Reconciliation: escrow holds more than DB expects (benign surplus, not a solvency issue), continuing startup"
+            "Reconciliation: escrow holds more than DB expects (benign surplus, not a solvency issue), continuing"
         );
     }
 
@@ -658,7 +723,7 @@ fn classify_and_report(
             shortfall = r.shortfall(),
             threshold = config.mismatch_threshold_raw,
             tolerance = startup_tolerance_raw(config, r.on_chain_actual),
-            "Reconciliation: custody shortfall within tolerance, continuing startup"
+            "Reconciliation: custody shortfall within tolerance, continuing"
         );
     }
 
@@ -674,7 +739,7 @@ fn classify_and_report(
         balanced,
         within_tolerance = within_tolerance.len(),
         surplus,
-        "Startup reconciliation passed"
+        "Reconciliation passed"
     );
 
     Ok(())
@@ -683,6 +748,12 @@ fn classify_and_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::escrow_sweep::tests::{
+        allowed_mint_account, mock_all_mints_allowed, mock_multiple_accounts,
+    };
+    use crate::operator::utils::account_util::find_allowed_mint_pda;
+    use spl_associated_token_account::get_associated_token_address_with_program_id;
+    use std::sync::Arc;
 
     // =========================================================================
     // directional accessor tests
@@ -1037,9 +1108,14 @@ mod tests {
         }
     }
 
-    /// `get_token_accounts_by_owner` returns jsonParsed token accounts; the sweep
-    /// sums them per mint. Build one such account entry for the mock RPC response.
-    fn token_account_entry(mint: &str, amount: u64) -> String {
+    /// `get_token_accounts_by_owner` returns jsonParsed token accounts. Build `instance`'s
+    /// ATA for `mint` as one such entry for the mock RPC response.
+    fn token_account_entry(instance: &Pubkey, mint: &str, amount: u64) -> String {
+        let ata = get_associated_token_address_with_program_id(
+            instance,
+            &mint.parse::<Pubkey>().unwrap(),
+            &spl_token::id(),
+        );
         format!(
             r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{owner}",
                 "executable":false,"rentEpoch":0,"space":165,
@@ -1047,7 +1123,6 @@ mod tests {
                     "parsed":{{"type":"account","info":{{"mint":"{mint}","owner":"{owner}",
                         "tokenAmount":{{"amount":"{amount}","decimals":6,"uiAmount":null,
                             "uiAmountString":"{amount}"}}}}}}}}}}}}"#,
-            ata = Pubkey::new_unique(),
             owner = Pubkey::new_unique(),
             mint = mint,
             amount = amount,
@@ -1055,12 +1130,17 @@ mod tests {
     }
 
     /// Mock both sweep calls (SPL Token and Token-2022). The SPL Token call (matched
-    /// by its program id in the request body) returns `entries`; the Token-2022 call
-    /// returns an empty list so balances are not double-counted.
-    async fn mock_escrow_sweep(server: &mut mockito::Server, entries: &[(String, u64)]) {
+    /// by its program id in the request body) returns `instance`'s ATAs for `entries`; the
+    /// Token-2022 call returns an empty list so balances are not double-counted. Every mint
+    /// is allowed.
+    async fn mock_escrow_sweep(
+        server: &mut mockito::Server,
+        instance: &Pubkey,
+        entries: &[(String, u64)],
+    ) {
         let value: Vec<String> = entries
             .iter()
-            .map(|(mint, amount)| token_account_entry(mint, *amount))
+            .map(|(mint, amount)| token_account_entry(instance, mint, *amount))
             .collect();
         let token_body = format!(
             r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":100}},"value":[{}]}},"id":1}}"#,
@@ -1083,6 +1163,7 @@ mod tests {
             .with_body(empty_body)
             .create_async()
             .await;
+        mock_all_mints_allowed(server).await;
     }
 
     #[tokio::test]
@@ -1110,13 +1191,13 @@ mod tests {
         // The supply invariant must always run, so a missing channel RPC fails the
         // escrow indexer boot rather than silently skipping the check.
         let mut server = mockito::Server::new_async().await;
-        mock_escrow_sweep(&mut server, &[]).await;
+        let seed = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[]).await;
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
         let storage = Storage::Mock(MockStorage::new());
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1137,14 +1218,14 @@ mod tests {
     #[tokio::test]
     async fn test_reconciliation_empty_db_and_empty_escrow_passes() {
         let mut server = mockito::Server::new_async().await;
-        mock_escrow_sweep(&mut server, &[]).await;
+        let seed = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[]).await;
 
         let storage = Storage::Mock(MockStorage::new());
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1168,8 +1249,9 @@ mod tests {
         // risk and is attacker-inducible, so startup continues with a warning instead
         // of failing closed.
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         // Healthy supply, so the ledger comparison stays the thing under test.
         mock_channel_supply(&mut server, 0).await;
 
@@ -1178,7 +1260,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1199,9 +1280,10 @@ mod tests {
     #[tokio::test]
     async fn test_reconciliation_surplus_does_not_block() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // DB expects 1000, on-chain has 1_000_000 => pure surplus, strict threshold 0.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000_000)]).await;
         // A readable supply below custody, so the invariant holds and the surplus
         // rule is what the test actually exercises.
         mock_channel_supply(&mut server, 1_000).await;
@@ -1214,7 +1296,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1234,8 +1315,9 @@ mod tests {
     #[tokio::test]
     async fn test_reconciliation_balanced_passes() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         // Healthy supply, so the ledger comparison stays the thing under test.
         mock_channel_supply(&mut server, 1_000).await;
 
@@ -1247,7 +1329,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1260,12 +1341,130 @@ mod tests {
         assert!(result.is_ok(), "balanced state should pass: {:?}", result);
     }
 
+    /// An attacker opens an escrow token account for a mint nobody allowed and makes the same
+    /// address a System account on the channel. Reading that mint's supply fails every round,
+    /// so it must never be read, or it stops every boot.
+    #[tokio::test]
+    async fn an_unapproved_mint_in_custody_does_not_stop_startup() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let allowed = Pubkey::new_unique();
+        let unapproved = Pubkey::new_unique();
+
+        // The escrow owns a token account for each mint. The attacker opened the unapproved one.
+        // Mocked here, not via mock_escrow_sweep, which treats every mint as allowed.
+        let sweep_body = format!(
+            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":100}},"value":[{},{}]}},"id":1}}"#,
+            token_account_entry(&instance, &allowed.to_string(), 1_000),
+            token_account_entry(&instance, &unapproved.to_string(), 0),
+        );
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+            .with_status(200)
+            .with_body(sweep_body)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":100},"value":[]},"id":1}"#)
+            .create_async()
+            .await;
+        // Only the allowed mint has an AllowedMint PDA.
+        let pdas = HashMap::from([(
+            find_allowed_mint_pda(&instance, &allowed),
+            allowed_mint_account(),
+        )]);
+        mock_multiple_accounts(&mut server, pdas, vec![100], Arc::default()).await;
+
+        // Channel side: the allowed mint is fully backed; the unapproved address is the poison.
+        mock_supply_for_mint(&mut server, &allowed, 1_000, None).await;
+        let unapproved_channel_read = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("getAccountInfo".to_string()),
+                mockito::Matcher::Regex(unapproved.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":100},"value":{"owner":"11111111111111111111111111111111","lamports":1000000,"data":["","base64"],"executable":false,"rentEpoch":0}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&allowed.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        };
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &instance,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an unapproved mint must not stop startup: {result:?}"
+        );
+        unapproved_channel_read.assert_async().await;
+    }
+
+    /// An allowed mint nobody has deposited yet has no channel mint. Anyone can send its
+    /// channel address lamports, leaving a System account there. That has minted nothing, so
+    /// it must not stop the boot.
+    #[tokio::test]
+    async fn an_approved_mint_squatted_on_the_channel_does_not_stop_startup() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        // AllowMint opened the instance ATA, so the sweep sees the mint holding nothing.
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 0)]).await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("getAccountInfo".to_string()))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":100},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["","base64"],"executable":false,"rentEpoch":0}}}"#)
+            .create_async()
+            .await;
+
+        let storage = Storage::Mock(MockStorage::new());
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        };
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a System account at an allowed mint's channel address must not stop startup: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_reconciliation_shortfall_within_threshold_passes() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // DB expects 1000, on-chain has 995 => shortfall 5 <= threshold 10 => ok
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 995)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 995)]).await;
         // Healthy supply, so the ledger comparison stays the thing under test.
         mock_channel_supply(&mut server, 1_000).await;
 
@@ -1277,7 +1476,6 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1297,9 +1495,10 @@ mod tests {
     #[tokio::test]
     async fn test_reconciliation_shortfall_exceeds_threshold_blocks() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // DB expects 1000, on-chain has 980 => shortfall 20 > threshold 10 => err
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
         // Supply matches custody, so the supply invariant passes and the ledger
         // comparison is the only thing left to fail.
         mock_channel_supply(&mut server, 980).await;
@@ -1312,7 +1511,6 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1344,8 +1542,9 @@ mod tests {
         released_by_status: u64,
     ) -> Result<(), IndexerError> {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
         mock_channel_supply(&mut server, supply).await;
 
         let mock_storage = MockStorage::new();
@@ -1369,7 +1568,7 @@ mod tests {
             &storage,
             &url,
             Some(&url),
-            &Pubkey::new_unique(),
+            &seed,
         )
         .await
     }
@@ -1450,8 +1649,9 @@ mod tests {
     async fn test_reconciliation_with_nonzero_withdrawals_balanced() {
         // 1500 deposits, 500 withdrawals => db_expected 1000; on-chain 1000 => balanced.
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         // Healthy supply, so the ledger comparison stays the thing under test.
         mock_channel_supply(&mut server, 1_000).await;
 
@@ -1463,7 +1663,6 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1487,9 +1686,10 @@ mod tests {
     #[tokio::test]
     async fn supply_invariant_is_not_fooled_by_custody_that_arrived_after_the_snapshot() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // Custody now holds the deposit backing the mint, and the channel has minted it.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         mock_channel_supply(&mut server, 1_000).await;
 
         // The snapshot predates the deposit: at that slot the escrow held nothing.
@@ -1510,7 +1710,7 @@ mod tests {
             &storage,
             &url,
             Some(&url),
-            &Pubkey::new_unique(),
+            &seed,
             &snapshot,
         )
         .await;
@@ -1528,9 +1728,10 @@ mod tests {
     #[tokio::test]
     async fn custody_released_before_its_burn_is_visible_clears_on_a_re_read() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // The fresh sweep sees the escrow already emptied by the release.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 0)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 0)]).await;
         // First reading still predates the burn; the next one sees the supply gone too.
         mock_channel_supply_times(&mut server, 1_000, Some(1)).await;
         mock_channel_supply(&mut server, 0).await;
@@ -1556,7 +1757,7 @@ mod tests {
             &storage,
             &url,
             Some(&url),
-            &Pubkey::new_unique(),
+            &seed,
             &snapshot,
         )
         .await;
@@ -1575,9 +1776,10 @@ mod tests {
     #[tokio::test]
     async fn a_healthy_snapshot_cannot_excuse_custody_that_is_gone() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // Escrow is empty on every reading, and the supply was never burned against it.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 0)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 0)]).await;
         mock_channel_supply(&mut server, 1_000).await;
 
         // Taken while custody still backed the supply, so the ledger comparison passes.
@@ -1600,7 +1802,7 @@ mod tests {
             &storage,
             &url,
             Some(&url),
-            &Pubkey::new_unique(),
+            &seed,
             &snapshot,
         )
         .await;
@@ -1678,8 +1880,9 @@ mod tests {
     #[tokio::test]
     async fn supply_breach_that_clears_on_a_re_read_is_not_fatal() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         // First reading catches supply above custody; the next one no longer does.
         mock_channel_supply_times(&mut server, 1_200, Some(1)).await;
         mock_channel_supply(&mut server, 1_000).await;
@@ -1692,7 +1895,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -1779,8 +1981,9 @@ mod tests {
     #[tokio::test]
     async fn supply_breach_is_not_cleared_by_a_failed_re_read() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         // First reading catches supply above custody; every re-read then fails outright.
         mock_channel_supply_times(&mut server, 1_200, Some(1)).await;
         mock_channel_supply_failure(&mut server).await;
@@ -1793,7 +1996,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -1823,9 +2025,10 @@ mod tests {
     #[tokio::test]
     async fn supply_that_is_never_readable_stops_startup() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // Custody and ledger agree, so only the unreadable supply can decide this.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         mock_channel_supply_failure(&mut server).await;
 
         let mock_storage = MockStorage::new();
@@ -1836,7 +2039,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -1866,10 +2068,12 @@ mod tests {
     #[tokio::test]
     async fn one_mint_cannot_confirm_a_breach_on_another_mints_readings() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let alpha = Pubkey::new_unique();
         let beta = Pubkey::new_unique();
         mock_escrow_sweep(
             &mut server,
+            &seed,
             &[(alpha.to_string(), 1_000), (beta.to_string(), 1_000)],
         )
         .await;
@@ -1896,7 +2100,6 @@ mod tests {
             mismatch_threshold_raw: 0,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -1925,9 +2128,10 @@ mod tests {
     async fn startup_reconciliation_supply_exceeds_custody_is_fatal() {
         // Custody sweep and channel supply share one server, routed by method.
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // custody 1000, ledger 1000 (balanced); but minted supply 1200 -> gap 200.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         mock_channel_supply(&mut server, 1_200).await;
 
         let mock_storage = MockStorage::new();
@@ -1938,7 +2142,6 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -1964,10 +2167,11 @@ mod tests {
     #[tokio::test]
     async fn startup_reconciliation_reports_the_supply_breach_over_a_stale_ledger() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // Custody 1000 against a ledger at 900 is a mismatch of 100, and minted supply
         // 1200 is 200 above custody. Both exceed the threshold on the same mint.
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         mock_channel_supply(&mut server, 1_200).await;
 
         let mock_storage = MockStorage::new();
@@ -1978,7 +2182,6 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -2005,8 +2208,9 @@ mod tests {
     #[tokio::test]
     async fn startup_reconciliation_supply_within_custody_passes() {
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000)]).await;
         // Supply equals custody: the invariant holds.
         mock_channel_supply(&mut server, 1_000).await;
 
@@ -2018,7 +2222,6 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
         let url = server.url();
         let result = run_startup_reconciliation(
             &config,
@@ -2042,12 +2245,12 @@ mod tests {
             mismatch_threshold_raw: 10,
             ..Default::default()
         };
-        let seed = Pubkey::new_unique();
 
         // Direction 1: custody far above the ledger, supply within custody.
         let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000_000)]).await;
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 1_000_000)]).await;
         mock_channel_supply(&mut server, 1_000).await;
         let surplus_storage = MockStorage::new();
         surplus_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
@@ -2071,7 +2274,12 @@ mod tests {
         // Direction 2: same balanced ledger, but the channel minted past custody.
         let mut breach_server = mockito::Server::new_async().await;
         let breach_mint = Pubkey::new_unique();
-        mock_escrow_sweep(&mut breach_server, &[(breach_mint.to_string(), 1_000)]).await;
+        mock_escrow_sweep(
+            &mut breach_server,
+            &seed,
+            &[(breach_mint.to_string(), 1_000)],
+        )
+        .await;
         mock_channel_supply(&mut breach_server, 1_200).await;
         let breach_storage = MockStorage::new();
         breach_storage.set_mint_balances(vec![make_mint_balance(
@@ -2099,6 +2307,247 @@ mod tests {
             ),
             "supply over custody must still halt: {:?}",
             breach
+        );
+    }
+
+    /// The supply check allows the same cushion as the ledger check: the larger of the
+    /// absolute threshold and the bps share of custody, and no more.
+    #[tokio::test]
+    async fn startup_supply_gap_within_bps_tolerance_passes_but_past_it_halts() {
+        let custody = 1_000;
+        // 100 bps of 1,000 custody allows 10 units: a 5-unit gap is within it, 11 is not.
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            reconciliation_tolerance_bps: 100,
+        };
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), custody)]).await;
+        mock_channel_supply(&mut server, custody + 5).await;
+
+        // A balanced ledger, so the supply check is the only thing that can fail.
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), custody, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a supply gap within the bps tolerance must not stop startup: {result:?}"
+        );
+
+        // One unit past the allowance, so a tolerance computed too large shows here.
+        let mut breach_server = mockito::Server::new_async().await;
+        let breach_mint = Pubkey::new_unique();
+        mock_escrow_sweep(
+            &mut breach_server,
+            &seed,
+            &[(breach_mint.to_string(), custody)],
+        )
+        .await;
+        mock_channel_supply(&mut breach_server, custody + 11).await;
+        let breach_storage = MockStorage::new();
+        breach_storage.set_mint_balances(vec![make_mint_balance(
+            &breach_mint.to_string(),
+            custody,
+            0,
+        )]);
+        let breach_storage = Storage::Mock(breach_storage);
+        let breach_url = breach_server.url();
+        let breach = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &breach_storage,
+            &breach_url,
+            Some(&breach_url),
+            &seed,
+        )
+        .await;
+        assert!(
+            matches!(
+                breach,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "a supply gap past the bps tolerance must still halt: {breach:?}"
+        );
+    }
+
+    /// A manual run compares nothing until the escrow ledger reaches the custody slot, so
+    /// status never stands in for a release the indexer has not recorded.
+    #[tokio::test]
+    async fn manual_reconciliation_refuses_a_ledger_behind_custody() {
+        // mock_escrow_sweep answers at this slot.
+        let snapshot_slot = 100;
+        for checkpoint in [None, Some(snapshot_slot - 10)] {
+            let mut server = mockito::Server::new_async().await;
+            let seed = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+
+            let mock_storage = MockStorage::new();
+            mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+            if let Some(slot) = checkpoint {
+                mock_storage.set_checkpoint(&program_key(ProgramType::Escrow), slot);
+            }
+            let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+            let url = server.url();
+            let result = run_manual_reconciliation(
+                &ReconciliationConfig::default(),
+                &storage,
+                &url,
+                Some(&url),
+                &seed,
+            )
+            .await;
+            match result {
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::LedgerCoverageIncomplete {
+                        snapshot_slot: reported,
+                    },
+                )) => assert_eq!(reported, snapshot_slot),
+                other => panic!("checkpoint {checkpoint:?} must be incomplete coverage: {other:?}"),
+            }
+            assert_eq!(
+                mock_storage.calls("get_mint_balances_for_reconciliation"),
+                0
+            );
+            assert_eq!(
+                mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+                0
+            );
+        }
+    }
+
+    /// Once the ledger covers the custody slot, a manual run judges the pinned ledger.
+    #[tokio::test]
+    async fn manual_reconciliation_judges_the_pinned_ledger_once_covered() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        // Custody 980 against a ledger of 1000, past a threshold of 10.
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+        mock_channel_supply(&mut server, 980).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        // mock_escrow_sweep answers at slot 100.
+        mock_storage.set_checkpoint(&program_key(ProgramType::Escrow), 100);
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+            ..Default::default()
+        };
+        let url = server.url();
+        let result = run_manual_reconciliation(&config, &storage, &url, Some(&url), &seed).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "a covered ledger must be compared: {result:?}"
+        );
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+            0
+        );
+    }
+
+    /// A checkpoint that cannot be read proves nothing about coverage, so the run stops as
+    /// an error before any ledger read.
+    #[tokio::test]
+    async fn manual_reconciliation_stops_on_an_unreadable_checkpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        mock_storage.set_should_fail("get_committed_checkpoint", true);
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+        let url = server.url();
+        let result = run_manual_reconciliation(
+            &ReconciliationConfig::default(),
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(ReconciliationError::Storage(
+                    _
+                )))
+            ),
+            "an unreadable checkpoint must stop the run: {result:?}"
+        );
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_reconciliation"),
+            0
+        );
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+            0
+        );
+    }
+
+    /// A resync that deleted rows and died no longer holds the live-state lock, so its
+    /// marker is what stops a manual run from judging the half-rebuilt ledger.
+    #[tokio::test]
+    async fn manual_reconciliation_stops_on_an_unfinished_resync() {
+        let custody = 980;
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), custody)]).await;
+        mock_channel_supply(&mut server, custody).await;
+
+        // The ledger matches custody, so a run that ignored the marker would pass.
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), custody, 0)]);
+        // mock_escrow_sweep answers at slot 100.
+        mock_storage.set_checkpoint(&program_key(ProgramType::Escrow), 100);
+        let resyncing = program_key(ProgramType::Withdraw);
+        *mock_storage.unfinished_resync.lock().unwrap() = Some(resyncing.clone());
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+        let url = server.url();
+        let result = run_manual_reconciliation(
+            &ReconciliationConfig::default(),
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        match result {
+            Err(IndexerError::Storage(StorageError::UnfinishedResync { program })) => {
+                assert_eq!(program, resyncing)
+            }
+            other => panic!("an unfinished resync must stop the run: {other:?}"),
+        }
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_reconciliation"),
+            0
         );
     }
 }

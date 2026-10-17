@@ -113,6 +113,9 @@ pub struct TransactionStatusUpdate {
     /// True when a remint was attempted but failed (ManualReview). Lets consumers
     /// distinguish "remint tried and failed" from "remint never attempted".
     pub remint_attempted: bool,
+    /// The caller already wrote `status` under its incarnation's fence, so the
+    /// writer only alerts. Writing it again could hit a row re-armed since.
+    pub alert_only: bool,
 }
 
 /// A Mint or InitializeMint transaction that has been sent but not yet confirmed.
@@ -221,6 +224,12 @@ pub struct SenderState {
     pub release_leases: HashMap<u64, DateTime<Utc>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
+    /// Last row id read from the durable remint backlog; `None` once it is drained or never armed.
+    pub remint_backlog_cursor: Option<i64>,
+    /// Ids handed off at runtime while the backlog drains; a page must never load them.
+    pub remint_runtime_ids: HashSet<i64>,
+    /// Backlog rows still waiting in the database past the cursor, as of the last page read.
+    pub remint_backlog_unloaded: u64,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.
     /// Shared with the dedicated poll task via `Arc`; capped at `MAX_IN_FLIGHT`.
     pub in_flight: Arc<InFlightQueue>,
@@ -298,6 +307,11 @@ pub struct PendingRemint {
     /// kept. A restart re-captures a later slot, which only asks for more
     /// coverage than before, never less.
     pub coverage_slot: Option<u64>,
+    /// Escrow checkpoint at the last coverage read; tells a catching-up indexer from a stuck one.
+    pub coverage_checkpoint: Option<u64>,
+    /// Expected waits taken without charging `finality_check_attempts`.
+    /// In memory only: a restart re-captures a later bound, so it starts a fresh wait.
+    pub free_waits: u32,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.

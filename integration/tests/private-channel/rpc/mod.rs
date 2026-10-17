@@ -1,6 +1,7 @@
 mod test_batch_atomicity;
 mod test_context;
 // mod test_cors; // Disabled - CORS is now handled by the gateway
+mod test_address_index_slot;
 mod test_blockhash_validation;
 mod test_channel_anchor;
 mod test_dedup_persistence;
@@ -20,6 +21,7 @@ mod test_mixed_transaction;
 mod test_non_admin;
 mod test_performance_samples;
 mod test_precompile_accounts;
+mod test_signature_status_snapshot;
 mod test_spl_token;
 mod test_swap;
 mod test_transaction_count;
@@ -45,6 +47,7 @@ mod test_admin_vm_initialize_mint_persists;
 // parallel-SVM SnapshotCallback coverage.
 mod test_parallel_svm_burst;
 
+pub use test_address_index_slot::run_address_index_slot_test;
 pub use test_blockhash_validation::run_blockhash_validation_test;
 pub use test_channel_anchor::run_channel_anchor_test;
 pub use test_context::{PrivateChannelContext, SolanaContext};
@@ -65,6 +68,7 @@ pub use test_mixed_transaction::run_mixed_transaction_test;
 pub use test_non_admin::run_non_admin_sending_admin_instruction_test;
 pub use test_performance_samples::run_performance_samples_test;
 pub use test_precompile_accounts::run_precompile_accounts_test;
+pub use test_signature_status_snapshot::run_signature_status_snapshot_test;
 pub use test_spl_token::run_spl_token_test;
 pub use test_swap::run_swap_clock_tests;
 pub use test_transaction_count::run_transaction_count_test;

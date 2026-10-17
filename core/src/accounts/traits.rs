@@ -132,12 +132,33 @@ impl AccountsDB {
         super::get_transaction_count::get_transaction_count(self).await
     }
 
+    /// Address index watermark and newest block slot, from Postgres in both
+    /// variants: the index lives only there, and both must share one snapshot.
+    pub async fn get_address_index_progress(&self) -> Result<Option<(i64, u64)>> {
+        let pool = match self {
+            AccountsDB::Postgres(postgres_db) => &postgres_db.pool,
+            AccountsDB::Redis(redis_db) => &redis_db.fallback.pool,
+        };
+        Ok(super::address_index_watermark::get_address_index_progress(pool).await?)
+    }
+
     pub async fn get_first_available_block(&self) -> Result<u64> {
         super::get_first_available_block::get_first_available_block(self).await
     }
 
+    pub async fn get_signature_status_snapshot(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<super::get_signature_status_snapshot::StatusSnapshot> {
+        super::get_signature_status_snapshot::get_signature_status_snapshot(self, signatures).await
+    }
+
     pub async fn get_blocks(&self, start_slot: u64, end_slot: Option<u64>) -> Result<Vec<u64>> {
         super::get_blocks::get_blocks(self, start_slot, end_slot).await
+    }
+
+    pub async fn newest_block_slot(&self) -> Result<Option<u64>> {
+        super::get_blocks::newest_block_slot(self).await
     }
 
     pub async fn get_blocks_with_limit(&self, start_slot: u64, limit: u64) -> Result<Vec<u64>> {

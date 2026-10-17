@@ -13,12 +13,11 @@ use crate::indexer::datasource::common::parser::withdraw::{
 use crate::indexer::datasource::common::parser::{EscrowInstruction, WithdrawInstruction};
 use crate::indexer::datasource::common::tx_validation::{
     check_inner_set_index, check_instruction, check_loaded_counts, check_signature,
+    targets_configured_instance,
 };
 use crate::indexer::datasource::common::types::CompiledInstruction;
 use crate::indexer::datasource::common::types::*;
-use crate::indexer::datasource::rpc_polling::types::{
-    InnerInstructions, Reported, RpcBlock, RpcTransactionWithMeta,
-};
+use crate::indexer::datasource::rpc_polling::types::{Reported, RpcBlock, RpcTransactionWithMeta};
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, error};
 
@@ -173,14 +172,17 @@ fn parse_block(
             true,
         )?
         .into_iter()
-        .map(|(signature, location, ix)| InstructionWithMetadata {
-            instruction: ProgramInstruction::Escrow(Box::new(ix)),
-            slot,
-            program_type,
-            signature: Some(signature),
-            instruction_index: location.top_level_index,
-            inner_index: location.inner.map(|i| i.inner_index),
-        })
+        .map(
+            |(signature, location, ix, transaction_index)| InstructionWithMetadata {
+                instruction: ProgramInstruction::Escrow(Box::new(ix)),
+                slot,
+                program_type,
+                signature: Some(signature),
+                transaction_index,
+                instruction_index: location.top_level_index,
+                inner_index: location.inner.map(|i| i.inner_index),
+            },
+        )
         .collect()),
         ProgramType::Withdraw => Ok(parse_block_for_program::<WithdrawInstruction>(
             block,
@@ -191,14 +193,17 @@ fn parse_block(
             false,
         )?
         .into_iter()
-        .map(|(signature, location, ix)| InstructionWithMetadata {
-            instruction: ProgramInstruction::Withdraw(Box::new(ix)),
-            slot,
-            program_type,
-            signature: Some(signature),
-            instruction_index: location.top_level_index,
-            inner_index: location.inner.map(|i| i.inner_index),
-        })
+        .map(
+            |(signature, location, ix, transaction_index)| InstructionWithMetadata {
+                instruction: ProgramInstruction::Withdraw(Box::new(ix)),
+                slot,
+                program_type,
+                signature: Some(signature),
+                transaction_index,
+                instruction_index: location.top_level_index,
+                inner_index: location.inner.map(|i| i.inner_index),
+            },
+        )
         .collect()),
     }
 }
@@ -221,26 +226,6 @@ pub fn decode_slot(
     }
 
     parse_block(block, slot, program_type, escrow_instance_id)
-}
-
-/// Whether this instruction names the configured escrow instance among its own accounts.
-/// Instance admission is transaction-wide, so a transaction of ours also carries other
-/// instances' instructions, and only ours are worth failing a slot on. `None` (withdraw) and
-/// an unresolvable index count as in scope, so an unreadable instruction still fails closed.
-pub(crate) fn targets_configured_instance(
-    instruction: &CompiledInstruction,
-    account_keys: &[Pubkey],
-    escrow_instance_id: Option<&Pubkey>,
-) -> bool {
-    let Some(instance_id) = escrow_instance_id else {
-        return true;
-    };
-
-    instruction.accounts.iter().any(|index| {
-        account_keys
-            .get(*index as usize)
-            .is_none_or(|key| key == instance_id)
-    })
 }
 
 /// First byte (Anchor-style discriminator) of an instruction's base58 data, or `None` if empty/undecodable.
@@ -314,8 +299,8 @@ fn validate_transaction(
     Ok((account_pubkeys, signature.clone()))
 }
 
-/// Parse a block and return (signature, location, instruction) for every
-/// instruction of the given program.
+/// Parse a block and return (signature, location, instruction, transaction index) for
+/// every instruction of the given program.
 fn parse_block_for_program<T>(
     block: &RpcBlock,
     filter_program_id: &str,
@@ -323,7 +308,7 @@ fn parse_block_for_program<T>(
     inner_discriminator_excluded: fn(u8) -> bool,
     escrow_instance_id: Option<&Pubkey>,
     require_inner_instructions: bool,
-) -> Result<Vec<(String, InstructionLocation, T)>, SlotRejection>
+) -> Result<Vec<(String, InstructionLocation, T, u32)>, SlotRejection>
 where
     T: std::fmt::Debug,
 {
@@ -336,6 +321,7 @@ where
         return Ok(instructions);
     };
 
+    // Enumerate before the failed-tx skip so the index is the position in the whole block.
     for (tx_position, tx_with_meta) in block.transactions.iter().enumerate() {
         // Only an explicit `err: null` is a success; a failed or unreported one is skipped.
         if tx_with_meta
@@ -400,7 +386,7 @@ where
                     location,
                 ) {
                     Ok(Some(ix)) => {
-                        instructions.push((signature.clone(), location, ix));
+                        instructions.push((signature.clone(), location, ix, tx_position as u32));
                     }
                     Ok(None) => {
                         debug!("Skipped unsupported instruction");
@@ -455,7 +441,7 @@ where
                     location,
                 ) {
                     Ok(Some(ix)) => {
-                        instructions.push((signature.clone(), location, ix));
+                        instructions.push((signature.clone(), location, ix, tx_position as u32));
                     }
                     Ok(None) => {
                         debug!("Skipped unsupported inner instruction");
@@ -576,7 +562,7 @@ mod tests {
         )
         .expect("the mock parsers used here decode every instruction")
         .into_iter()
-        .map(|(sig, location, value)| (sig, location.top_level_index, value))
+        .map(|(sig, location, value, _)| (sig, location.top_level_index, value))
         .collect()
     }
 
@@ -1332,7 +1318,7 @@ mod tests {
     // CPI (inner instruction) Tests
     // ============================================================================
 
-    use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
+    use crate::indexer::datasource::common::types::{InnerInstruction, InnerInstructions};
     use solana_transaction_status::{UiAddressTableLookup, UiLoadedAddresses};
 
     fn inner(program_id_index: u8, data: &str, stack_height: u32) -> InnerInstruction {
@@ -1375,7 +1361,7 @@ mod tests {
         .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 1);
-        let (sig, location, data) = &result[0];
+        let (sig, location, data, _) = &result[0];
         assert_eq!(sig, &test_sig("sig_cpi"));
         assert_eq!(location.top_level_index, 0);
         assert_eq!(location.inner.unwrap().inner_index, 1);
@@ -1961,5 +1947,186 @@ mod tests {
         assert_eq!(deposit_amount(&result[0]), amount);
         assert_eq!(result[0].instruction_index, 0);
         assert_eq!(result[0].inner_index, None);
+    }
+
+    /// A getBlock response whose inner instructions carry `stackHeight: null` or
+    /// omit it still decodes both CPI deposits, each with its own event amount.
+    #[test]
+    fn real_parser_decodes_cpi_deposits_without_stack_heights() {
+        use crate::operator::utils::account_util::find_instance_pda;
+        use crate::test_utils::escrow_fixtures::deposit_event_bytes_full;
+
+        // Escrow at key 0, foreign router at key 1 (also the user), instance PDA at 2, mint at 3.
+        let instance_seed = test_pubkey(50);
+        let mut account_keys: Vec<String> = (0u8..12)
+            .map(|index| test_pubkey(index).to_string())
+            .collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+        account_keys[2] = find_instance_pda(&instance_seed).to_string();
+        let (user, mint) = (test_pubkey(1), test_pubkey(3));
+        let event = |amount: u64| {
+            bs58::encode(deposit_event_bytes_full(
+                instance_seed,
+                user,
+                amount,
+                user,
+                mint,
+            ))
+            .into_string()
+        };
+        let deposit = bs58::encode(deposit_ix_bytes(1000, None)).into_string();
+
+        let response = json!({
+            "blockhash": "xbRm5shPwQECtyLGoxKKERD7vRqPeNHYqB6vt6hzjMb",
+            "parentSlot": 99u64,
+            "transactions": [{
+                "transaction": {
+                    "signatures": [test_sig("stackless")],
+                    "message": {
+                        "header": {
+                            "numRequiredSignatures": 1,
+                            "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": 1
+                        },
+                        "accountKeys": account_keys,
+                        "recentBlockhash": "Fu11pcSvhJBX3sNaE1FzsXC6jPx5wJPTaWrdsfmMPnos",
+                        "instructions": [{
+                            "programIdIndex": 1,
+                            "accounts": [],
+                            "data": "router"
+                        }]
+                    }
+                },
+                "meta": {
+                    "err": null,
+                    "status": { "Ok": null },
+                    "fee": 5000,
+                    "logMessages": [],
+                    "loadedAddresses": { "writable": [], "readonly": [] },
+                    // Older nodes send `stackHeight: null`; some omit the key.
+                    "innerInstructions": [{
+                        "index": 0,
+                        "instructions": [
+                            { "programIdIndex": 0, "accounts": (0u8..12).collect::<Vec<u8>>(), "data": deposit, "stackHeight": null },
+                            { "programIdIndex": 0, "accounts": [], "data": event(300) },
+                            { "programIdIndex": 0, "accounts": (0u8..12).collect::<Vec<u8>>(), "data": deposit },
+                            { "programIdIndex": 0, "accounts": [], "data": event(480), "stackHeight": null }
+                        ]
+                    }]
+                }
+            }]
+        });
+
+        let block: RpcBlock = serde_json::from_value(response)
+            .expect("a getBlock response without stack heights must deserialize");
+
+        let result = parse_block(&block, 100, ProgramType::Escrow, None)
+            .expect("CPI deposits without stack heights decode");
+
+        assert_eq!(result.len(), 2, "both CPI deposits are indexed");
+        assert_eq!(result[0].inner_index, Some(0));
+        assert_eq!(
+            deposit_amount(&result[0]),
+            300,
+            "deposit A reads its own event"
+        );
+        assert_eq!(result[1].inner_index, Some(2));
+        assert_eq!(
+            deposit_amount(&result[1]),
+            480,
+            "deposit B reads its own event"
+        );
+    }
+
+    /// A successful pre-memo release has 13 accounts. It must decode on replay,
+    /// or backfill stalls on the slot; one account fewer still fails it closed.
+    #[test]
+    fn pre_memo_release_decodes_and_short_release_fails_the_slot() {
+        use crate::test_utils::escrow_fixtures::release_funds_ix_bytes;
+
+        let our_instance = test_pubkey(200);
+        let release = |n_accounts: u8| {
+            // Key 0 is the escrow program; the release reads keys 1..=n, instance at slot 2.
+            let mut account_keys: Vec<String> = (0u8..=n_accounts)
+                .map(|i| test_pubkey(i).to_string())
+                .collect();
+            account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+            account_keys[3] = our_instance.to_string();
+            let data = release_funds_ix_bytes(1_000, test_pubkey(100), 42);
+
+            let mut block = create_test_block();
+            block.transactions.push(create_successful_transaction(
+                format!("sig_release_{n_accounts}"),
+                account_keys,
+                vec![create_instruction(
+                    0,
+                    (1..=n_accounts).collect(),
+                    bs58::encode(data).into_string(),
+                )],
+            ));
+            parse_block(&block, 7, ProgramType::Escrow, Some(&our_instance))
+        };
+
+        let rows = release(13).expect("a 13-account release decodes");
+        assert_eq!(rows.len(), 1);
+        let ProgramInstruction::Escrow(ix) = &rows[0].instruction else {
+            panic!("expected an Escrow instruction");
+        };
+        let EscrowInstruction::ReleaseFunds { data, .. } = ix.as_ref() else {
+            panic!("expected a ReleaseFunds instruction");
+        };
+        assert_eq!(data.transaction_nonce, 42);
+
+        assert!(matches!(release(12), Err(SlotRejection::Undecodable(_))));
+    }
+
+    /// The transaction index is the position in the whole block, so failed and
+    /// unrelated transactions before ours still count. Yellowstone numbers them the same way.
+    #[test]
+    fn transaction_index_counts_every_transaction_in_the_block() {
+        // Escrow program at key 0; keys 1..12 fill the deposit's accounts.
+        let mut account_keys: Vec<String> =
+            (0u8..12).map(|key| test_pubkey(key).to_string()).collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+        let deposit = create_instruction(
+            0,
+            (0u8..12).collect(),
+            bs58::encode(deposit_ix_bytes(1000, None)).into_string(),
+        );
+
+        let mut block = create_test_block();
+        // Position 0: a failed escrow transaction, which is skipped.
+        block.transactions.push(create_failed_transaction(
+            "sig_failed".to_string(),
+            account_keys.clone(),
+            vec![deposit.clone()],
+        ));
+        // Position 1: an unrelated transaction.
+        block.transactions.push(create_successful_transaction(
+            "sig_unrelated".to_string(),
+            create_account_keys_with_program(TEST_PROGRAM_ID, 0),
+            vec![create_instruction(0, vec![], "unrelated".to_string())],
+        ));
+        // Position 2: our deposit, with its event self-CPI.
+        let mut ours =
+            create_successful_transaction("sig_deposit".to_string(), account_keys, vec![deposit]);
+        ours.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 0,
+                        accounts: vec![],
+                        data: bs58::encode(deposit_event_bytes(1000)).into_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
+        block.transactions.push(ours);
+
+        let rows = parse_block(&block, 7, ProgramType::Escrow, None).expect("the deposit decodes");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transaction_index, 2);
     }
 }

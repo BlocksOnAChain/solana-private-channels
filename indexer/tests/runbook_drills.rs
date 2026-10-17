@@ -250,6 +250,18 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         (
+            "transfer-hook validation account missing for mint:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "transfer-hook validation account invalid for mint",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "transfer-hook accounts exceed the per-transfer cap",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
             "withdrawal pipeline halted after poison-pill",
             "indexer/src/operator/processor.rs",
         ),
@@ -869,7 +881,7 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
         .await?;
 
     // Recovery query returns only the unresolved row.
-    let pending = storage.get_pending_remint_transactions().await?;
+    let pending = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert_eq!(
         pending.len(),
         1,

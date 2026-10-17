@@ -9,7 +9,12 @@ use crate::{
     scheduler::{ConflictFreeBatch, TransactionWithIndex},
     stage_metrics::{NoopMetrics, SharedMetrics},
     stages::{execute_batch, get_execution_deps, sigverify_transaction, SigverifyResult},
-    transactions::{has_address_table_lookups, ADDRESS_LOOKUP_UNSUPPORTED},
+    transactions::{
+        all_instructions_allowed, has_address_table_lookups, has_unused_writable_account,
+        has_writable_program_or_reserved_account, lists_native_mint, ADDRESS_LOOKUP_UNSUPPORTED,
+        NATIVE_MINT_UNSUPPORTED, PROGRAM_NOT_ALLOWED, UNUSED_WRITABLE_ACCOUNT,
+        WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT,
+    },
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use jsonrpsee::core::RpcResult;
@@ -158,6 +163,25 @@ pub async fn simulate_transaction(
     SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
         .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
 
+    if lists_native_mint(&sanitized_tx) {
+        return Err(custom_error(INVALID_PARAMS_CODE, NATIVE_MINT_UNSUPPORTED));
+    }
+
+    if !all_instructions_allowed(&sanitized_tx) {
+        return Err(custom_error(INVALID_PARAMS_CODE, PROGRAM_NOT_ALLOWED));
+    }
+
+    if has_unused_writable_account(&sanitized_tx) {
+        return Err(custom_error(INVALID_PARAMS_CODE, UNUSED_WRITABLE_ACCOUNT));
+    }
+
+    if has_writable_program_or_reserved_account(&sanitized_tx) {
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT,
+        ));
+    }
+
     // Checked here so a bad address list never pays for a simulation.
     if let Some(accounts_config) = config.accounts.as_ref() {
         validate_accounts_config(accounts_config, sanitized_tx.message().account_keys().len())?;
@@ -216,8 +240,8 @@ pub async fn simulate_transaction(
         transaction: Arc::new(sanitized_tx),
         index: 0,
     });
-    // Simulation runs a single transaction; intra-batch parallelism is
-    // unnecessary, so disable it (max_svm_workers=1 forces sequential path).
+    // One transaction, so max_svm_workers=1. The deps keep a private admission counter:
+    // a simulation sends no results, so the node's counter would stall the settler.
     let mut execution_deps = get_execution_deps(
         read_deps.accounts_db.clone(),
         // A throwaway BOB that nothing settles into.
@@ -380,7 +404,14 @@ mod tests {
     use crate::processor::CHANNEL_SLOT;
     use crate::rpc::constants::PER_ACCOUNT_JSON_OVERHEAD;
     use solana_account_decoder_client_types::UiAccountData;
-    use solana_sdk::{account::AccountSharedData, clock::Slot};
+    use solana_sdk::{
+        account::AccountSharedData,
+        clock::Slot,
+        hash::Hash,
+        message::{compiled_instruction::CompiledInstruction, Message, MessageHeader},
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
     use solana_svm_callback::InvokeContextCallback;
     use std::{
         collections::HashMap,
@@ -617,8 +648,21 @@ mod tests {
         assert!(served[2].is_some(), "a known account must still be served");
     }
 
-    /// Base64 of a signed transfer carrying `extra` as unused readonly keys.
-    fn encoded_transfer(extra: &[Pubkey]) -> String {
+    /// Base64 of a signed memo carrying `extra` as unused readonly keys.
+    fn encoded_memo(extra: &[Pubkey]) -> String {
+        encoded_with(
+            |_| {
+                solana_sdk::instruction::Instruction::new_with_bytes(spl_memo::id(), b"sim", vec![])
+            },
+            extra,
+        )
+    }
+
+    /// Base64 of a signed tx over the instruction `make_ix` builds for its payer.
+    fn encoded_with(
+        make_ix: impl FnOnce(&Pubkey) -> solana_sdk::instruction::Instruction,
+        extra: &[Pubkey],
+    ) -> String {
         use solana_sdk::{
             hash::Hash,
             message::Message,
@@ -626,11 +670,7 @@ mod tests {
             transaction::{Transaction, VersionedTransaction},
         };
         let payer = Keypair::new();
-        let ix = solana_system_interface::instruction::transfer(
-            &payer.pubkey(),
-            &Pubkey::new_unique(),
-            100,
-        );
+        let ix = make_ix(&payer.pubkey());
         let mut msg = Message::new(&[ix], Some(&payer.pubkey()));
         msg.account_keys.extend_from_slice(extra);
         msg.header.num_readonly_unsigned_accounts += extra.len() as u8;
@@ -644,6 +684,11 @@ mod tests {
             admin_keys: vec![],
             max_blockhashes: 150,
             simulation_permits: tokio::sync::Semaphore::new(permits),
+            block_list_permits: tokio::sync::Semaphore::new(
+                crate::rpc::constants::block_list_slots(
+                    crate::accounts::postgres::DEFAULT_PG_MAX_CONNECTIONS,
+                ),
+            ),
         }
     }
 
@@ -655,13 +700,13 @@ mod tests {
         let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
 
         let held = deps.simulation_permits.try_acquire().unwrap();
-        let err = simulate_transaction(&deps, encoded_transfer(&[]), None)
+        let err = simulate_transaction(&deps, encoded_memo(&[]), None)
             .await
             .expect_err("no permit is free");
         assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
 
         drop(held);
-        let err = simulate_transaction(&deps, encoded_transfer(&[]), None)
+        let err = simulate_transaction(&deps, encoded_memo(&[]), None)
             .await
             .expect_err("the store is unreachable");
         assert_eq!(err.code(), JSON_RPC_SERVER_ERROR, "{}", err.message());
@@ -671,6 +716,108 @@ mod tests {
             1,
             "a failed call must release its permit"
         );
+    }
+
+    /// A tx listing the native mint is refused as sendTransaction refuses it,
+    /// before any permit or store read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_mint_reference_rejected() {
+        let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        let encoded = encoded_memo(&[spl_token::native_mint::id()]);
+
+        let err = simulate_transaction(&deps, encoded, None)
+            .await
+            .expect_err("a tx listing the native mint must be refused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), NATIVE_MINT_UNSUPPORTED);
+    }
+
+    /// A writable key no instruction uses is refused as sendTransaction refuses
+    /// it, before any permit or store read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unused_writable_account_rejected() {
+        let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        let payer = Keypair::new();
+        // Key 1 is writable, but the Memo is given no accounts.
+        let message = Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer.pubkey(), Pubkey::new_unique(), spl_memo::id()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 2,
+                accounts: vec![],
+                data: b"carrier".to_vec(),
+            }],
+        };
+        let tx = Transaction::new(&[&payer], message, Hash::default());
+        let encoded =
+            STANDARD.encode(bincode::serialize(&tx).expect("a transaction must serialize"));
+
+        let err = simulate_transaction(&deps, encoded, None)
+            .await
+            .expect_err("a writable key no instruction uses must be refused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), UNUSED_WRITABLE_ACCOUNT);
+    }
+
+    /// A writable program or reserved key is refused as sendTransaction refuses it,
+    /// before any permit or store read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writable_program_or_reserved_account_rejected() {
+        let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        // spl_token is a loaded program, the clock sysvar a reserved key.
+        for protected_key in [spl_token::ID, solana_sdk_ids::sysvar::clock::ID] {
+            let payer = Keypair::new();
+            // Key 1 is writable and given to an ATA instruction, so it is not unused.
+            let message = Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: vec![
+                    payer.pubkey(),
+                    protected_key,
+                    spl_associated_token_account::id(),
+                ],
+                recent_blockhash: Hash::default(),
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 2,
+                    accounts: vec![1],
+                    data: b"carrier".to_vec(),
+                }],
+            };
+            let tx = Transaction::new(&[&payer], message, Hash::default());
+            let encoded =
+                STANDARD.encode(bincode::serialize(&tx).expect("a transaction must serialize"));
+
+            let err = simulate_transaction(&deps, encoded, None)
+                .await
+                .expect_err("a writable program or reserved key must be refused");
+            assert_eq!(err.code(), INVALID_PARAMS_CODE);
+            assert_eq!(err.message(), WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT);
+        }
+    }
+
+    /// A System instruction is refused as sendTransaction refuses it, before any
+    /// permit or store read, so preflight never approves a tx that cannot land.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn system_instruction_rejected() {
+        let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        let encoded = encoded_with(
+            |payer| solana_system_interface::instruction::transfer(payer, &Pubkey::new_unique(), 1),
+            &[],
+        );
+
+        let err = simulate_transaction(&deps, encoded, None)
+            .await
+            .expect_err("a System transfer must be refused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), PROGRAM_NOT_ALLOWED);
     }
 
     /// A simulation may fetch no more than one transaction's account data cap,
@@ -694,7 +841,7 @@ mod tests {
             .await;
         let deps = read_deps(crate::accounts::AccountsDB::Redis(redis_db), 8);
 
-        let err = simulate_transaction(&deps, encoded_transfer(&[grown]), None)
+        let err = simulate_transaction(&deps, encoded_memo(&[grown]), None)
             .await
             .expect_err("the fetch passes the per-transaction cap");
         assert_eq!(err.code(), JSON_RPC_SERVER_ERROR, "{}", err.message());

@@ -2,7 +2,7 @@ use crate::{
     error::{account::AccountError, ParserError},
     indexer::datasource::common::parser::resolve_account,
     indexer::datasource::common::types::*,
-    indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions},
+    operator::utils::account_util::find_instance_pda,
 };
 
 use borsh::BorshDeserialize;
@@ -16,9 +16,9 @@ pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1G
 const CREATE_INSTANCE: u8 = 0;
 const ALLOW_MINT: u8 = 1;
 const BLOCK_MINT: u8 = 2;
-// pub(crate) so shared test fixtures can build valid Deposit instruction data.
+// pub(crate) so shared test fixtures can build valid Deposit and ReleaseFunds data.
 pub(crate) const DEPOSIT: u8 = 6;
-const RELEASE_FUNDS: u8 = 7;
+pub(crate) const RELEASE_FUNDS: u8 = 7;
 const ROTATE_BITMAP: u8 = 8;
 
 // Only the post-bitmap layouts are decoded. A pre-bitmap release can only name
@@ -26,7 +26,10 @@ const ROTATE_BITMAP: u8 = 8;
 // is not the configured one is dropped before it reaches storage.
 const CREATE_INSTANCE_ACCOUNTS: usize = 8;
 const BLOCK_MINT_ACCOUNTS: usize = 7;
-const RELEASE_FUNDS_ACCOUNTS: usize = 14;
+// ReleaseFunds reads only the 13 accounts every bitmap-era version shares; later ones
+// (memo program, hook extras) are version-specific and ignored. A new account the
+// indexer must read means parsing both layouts, as BlockMint does, not raising this.
+const RELEASE_FUNDS_MIN_ACCOUNTS: usize = 13;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
 
 // BlockMint before the gates: no args, and a system_program at index 5. Removing
@@ -40,11 +43,19 @@ pub(crate) const EVENT_IX_TAG_LE: &[u8] = &[0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 
 const ALLOW_MINT_EVENT_DISCRIMINATOR: u8 = 1;
 pub(crate) const DEPOSIT_EVENT_DISCRIMINATOR: u8 = 6;
 const EVENT_DISCRIMINATOR_INDEX: usize = 8;
+// AllowMintEvent: tag(8)+disc(1)+instance_seed(32) = 41
+const ALLOW_MINT_EVENT_MINT_INDEX: usize = 41;
 // AllowMintEvent: tag(8)+disc(1)+instance_seed(32)+mint(32) = 73
 const EVENT_DECIMALS_INDEX: usize = 73;
 // DepositEvent: tag(8)+disc(1)+instance_seed(32)+user(32) = 73
 // (same offset, different event)
 const EVENT_AMOUNT_INDEX: usize = 73;
+// DepositEvent identity fields: instance_seed(32) after disc, user(32) before amount(8),
+// then recipient(32) and mint(32).
+const DEPOSIT_EVENT_INSTANCE_SEED_INDEX: usize = 9;
+const DEPOSIT_EVENT_USER_INDEX: usize = 41;
+const DEPOSIT_EVENT_RECIPIENT_INDEX: usize = 81;
+const DEPOSIT_EVENT_MINT_INDEX: usize = 113;
 
 // ******************************************************************************************
 // Instruction types
@@ -173,6 +184,10 @@ pub struct CreateInstanceData {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
 pub struct AllowMintData {
     pub bump: u8,
+    /// Per-withdrawal fee on the channel. Zero is allowed and means no fee.
+    pub withdraw_fee: u64,
+    /// Smallest channel withdrawal amount. Zero means no minimum.
+    pub min_withdraw_amount: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -286,7 +301,13 @@ pub fn parse_escrow_instruction(
 
     match discriminator {
         CREATE_INSTANCE => parse_create_instance(ix_data, instruction, account_keys),
-        ALLOW_MINT => parse_allow_mint(ix_data, instruction, account_keys, inner_instructions),
+        ALLOW_MINT => parse_allow_mint(
+            ix_data,
+            instruction,
+            account_keys,
+            inner_instructions,
+            location,
+        ),
         BLOCK_MINT => parse_block_mint(ix_data, instruction, account_keys),
         DEPOSIT => parse_deposit(
             ix_data,
@@ -301,22 +322,102 @@ pub fn parse_escrow_instruction(
     }
 }
 
-/// Decode an inner instruction and return its amount only if it is the escrow program's DepositEvent self-CPI; the program-id check stops a foreign instruction whose data merely starts with the event tag from being read as the event.
+/// Every field of an escrow DepositEvent self-CPI.
+struct DecodedDepositEvent {
+    instance_seed: Pubkey,
+    user: Pubkey,
+    amount: u64,
+    recipient: Pubkey,
+    mint: Pubkey,
+}
+
+fn is_escrow_program(inner: &InnerInstruction, account_keys: &[Pubkey]) -> bool {
+    account_keys
+        .get(inner.instruction.program_id_index as usize)
+        .is_some_and(|program_id| program_id.to_string() == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+}
+
+/// Decode an inner instruction only if it is the escrow program's DepositEvent self-CPI; the program-id check stops a foreign instruction whose data merely starts with the event tag from being read as the event.
+fn decode_deposit_event(
+    inner: &InnerInstruction,
+    account_keys: &[Pubkey],
+) -> Option<DecodedDepositEvent> {
+    if !is_escrow_program(inner, account_keys) {
+        return None;
+    }
+    let event_data = bs58::decode(&inner.instruction.data).into_vec().ok()?;
+    if event_data.len() < 145
+        || !event_data.starts_with(EVENT_IX_TAG_LE)
+        || event_data[EVENT_DISCRIMINATOR_INDEX] != DEPOSIT_EVENT_DISCRIMINATOR
+    {
+        return None;
+    }
+    // The `>= 145` length guard keeps every slice below in bounds.
+    let key_at = |index: usize| Pubkey::try_from(&event_data[index..index + 32]).ok();
+    let amount_bytes: [u8; 8] = event_data[EVENT_AMOUNT_INDEX..EVENT_AMOUNT_INDEX + 8]
+        .try_into()
+        .ok()?;
+    Some(DecodedDepositEvent {
+        instance_seed: key_at(DEPOSIT_EVENT_INSTANCE_SEED_INDEX)?,
+        user: key_at(DEPOSIT_EVENT_USER_INDEX)?,
+        amount: u64::from_le_bytes(amount_bytes),
+        recipient: key_at(DEPOSIT_EVENT_RECIPIENT_INDEX)?,
+        mint: key_at(DEPOSIT_EVENT_MINT_INDEX)?,
+    })
+}
+
 fn deposit_event_amount(inner: &InnerInstruction, account_keys: &[Pubkey]) -> Option<u64> {
+    decode_deposit_event(inner, account_keys).map(|event| event.amount)
+}
+
+fn stackless_deposit_error(reason: &str) -> ParserError {
+    ParserError::InstructionParseFailed {
+        reason: format!("CPI deposit without stack height: {reason}"),
+    }
+}
+
+/// Errors unless the event names the deposit's own user, mint, recipient and instance.
+fn check_event_matches_deposit(
+    event: &DecodedDepositEvent,
+    accounts: &DepositAccounts,
+    data: &DepositData,
+) -> Result<(), ParserError> {
+    let mismatched = if event.user != accounts.user {
+        Some("user")
+    } else if event.mint != accounts.mint {
+        Some("mint")
+    } else if event.recipient != data.recipient.unwrap_or(accounts.user) {
+        Some("recipient")
+    } else if find_instance_pda(&event.instance_seed) != accounts.instance {
+        Some("instance")
+    } else {
+        None
+    };
+    match mismatched {
+        Some(field) => Err(stackless_deposit_error(&format!(
+            "DepositEvent {field} does not match the deposit"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Decode an inner instruction and return its decimals only if it is the escrow program's AllowMintEvent self-CPI for `mint`; the mint check stops another AllowMint's event from supplying the decimals.
+fn allow_mint_event_decimals(
+    inner: &InnerInstruction,
+    account_keys: &[Pubkey],
+    mint: &Pubkey,
+) -> Option<u8> {
     let program_id = account_keys.get(inner.instruction.program_id_index as usize)?;
     if program_id.to_string() != PRIVATE_CHANNEL_ESCROW_PROGRAM_ID {
         return None;
     }
     let event_data = bs58::decode(&inner.instruction.data).into_vec().ok()?;
-    if event_data.len() >= 145
+    if event_data.len() >= 74
         && event_data.starts_with(EVENT_IX_TAG_LE)
-        && event_data[EVENT_DISCRIMINATOR_INDEX] == DEPOSIT_EVENT_DISCRIMINATOR
+        && event_data[EVENT_DISCRIMINATOR_INDEX] == ALLOW_MINT_EVENT_DISCRIMINATOR
+        && event_data[ALLOW_MINT_EVENT_MINT_INDEX..EVENT_DECIMALS_INDEX] == *mint.as_ref()
     {
-        // The `>= 145` length guard guarantees this slice is exactly 8 bytes.
-        let amount_bytes: [u8; 8] = event_data[EVENT_AMOUNT_INDEX..EVENT_AMOUNT_INDEX + 8]
-            .try_into()
-            .ok()?;
-        Some(u64::from_le_bytes(amount_bytes))
+        Some(event_data[EVENT_DECIMALS_INDEX])
     } else {
         None
     }
@@ -363,6 +464,7 @@ fn parse_allow_mint(
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
     inner_instructions: &[InnerInstructions],
+    location: InstructionLocation,
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let ix_data = <AllowMintData as borsh::BorshDeserialize>::deserialize(&mut &data[..])?;
 
@@ -389,31 +491,27 @@ fn parse_allow_mint(
         private_channel_escrow_program: resolve_account(instruction, account_keys, 10)?,
     };
 
-    for inner_instruction_set in inner_instructions {
-        for inner_instruction in &inner_instruction_set.instructions {
-            let Ok(event_data) = bs58::decode(&inner_instruction.instruction.data).into_vec()
-            else {
-                continue;
-            };
+    // AllowMint is only indexed top-level (see `escrow_inner_discriminator_excluded`),
+    // so the inner set at its own index is its whole subtree.
+    let decimals = inner_instructions
+        .iter()
+        .find(|set| set.index as u32 == location.top_level_index)
+        .and_then(|set| {
+            set.instructions
+                .iter()
+                .find_map(|inner| allow_mint_event_decimals(inner, account_keys, &accounts.mint))
+        });
 
-            if event_data.len() >= 74
-                && event_data.starts_with(EVENT_IX_TAG_LE)
-                && event_data[EVENT_DISCRIMINATOR_INDEX] == ALLOW_MINT_EVENT_DISCRIMINATOR
-            {
-                return Ok(Some(EscrowInstruction::AllowMint {
-                    accounts,
-                    data: ix_data,
-                    event: AllowMintEvent {
-                        decimals: event_data[EVENT_DECIMALS_INDEX],
-                    },
-                }));
-            }
-        }
+    match decimals {
+        Some(decimals) => Ok(Some(EscrowInstruction::AllowMint {
+            accounts,
+            data: ix_data,
+            event: AllowMintEvent { decimals },
+        })),
+        None => Err(ParserError::InstructionParseFailed {
+            reason: "No allow mint event found".to_string(),
+        }),
     }
-
-    Err(ParserError::InstructionParseFailed {
-        reason: "No allow mint event found".to_string(),
-    })
 }
 
 /// Parse BlockMint instruction.
@@ -521,9 +619,8 @@ fn parse_deposit(
     // deeper (a higher stack height). Take that deeper run, which ends as soon as
     // the height drops back to this deposit's level, and read the event from it.
     //
-    // A CPI deposit with no stack height can't be scoped to its subtree, so a
-    // set holding several deposits would attribute the wrong amount. Rather than
-    // guess, error out. A top-level deposit needs no
+    // A CPI deposit with no stack height falls back to call order and binds the
+    // event to the deposit's accounts. A top-level deposit needs no
     // stage 2: its whole set is its own subtree.
     let scoped_set = inner_instructions
         .iter()
@@ -540,13 +637,27 @@ fn parse_deposit(
                 .take_while(|inner| inner.stack_height.is_some_and(|h| h > own_height))
                 .find_map(|inner| deposit_event_amount(inner, account_keys))
         }
-        // CPI deposit with no depth: can't isolate the subtree, so refuse to guess.
-        // Occurs only when the data source omits stack height (e.g. an old RPC node
-        // or a Geyser feed that doesn't emit stackHeight).
-        (Some(_), Some(_)) => {
-            return Err(ParserError::InstructionParseFailed {
-                reason: "CPI deposit without stack height: cannot scope DepositEvent".to_string(),
-            });
+        // No depth: entries are in call order and nothing inside a Deposit can call the
+        // escrow except its own EmitEvent, so the first escrow entry after it is its event.
+        // Never skip past that entry, so a source that dropped the event fails closed.
+        (Some(set), Some(inner_loc)) => {
+            let start = inner_loc.inner_index as usize + 1;
+            let first_escrow = set
+                .instructions
+                .iter()
+                .skip(start)
+                .find(|inner| is_escrow_program(inner, account_keys))
+                .ok_or_else(|| stackless_deposit_error("no escrow entry after it"))?;
+            let event = decode_deposit_event(first_escrow, account_keys).ok_or_else(|| {
+                stackless_deposit_error("first escrow entry after it is not a DepositEvent")
+            })?;
+            check_event_matches_deposit(&event, &accounts, &ix_data)?;
+            tracing::debug!(
+                top_level_index = location.top_level_index,
+                inner_index = inner_loc.inner_index,
+                "CPI deposit without stack height read its event by call order"
+            );
+            Some(event.amount)
         }
         // Top-level deposit: the whole set is its subtree, so scan it directly.
         (Some(set), None) => set
@@ -572,16 +683,18 @@ fn parse_deposit(
     }
 }
 
-/// Parse ReleaseFunds in the bitmap-era layout.
+/// Parse ReleaseFunds in the bitmap-era layout. 13 accounts is safe to accept: the
+/// current program rejects fewer than 14, and failed transactions never reach here,
+/// so a successful 13-account release can only be a pre-memo one.
 fn parse_release_funds(
     data: &[u8],
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let account_count = instruction.accounts.len();
-    if account_count < RELEASE_FUNDS_ACCOUNTS {
+    if account_count < RELEASE_FUNDS_MIN_ACCOUNTS {
         return Err(AccountError::InsufficientAccounts {
-            required: RELEASE_FUNDS_ACCOUNTS,
+            required: RELEASE_FUNDS_MIN_ACCOUNTS,
             actual: account_count,
         }
         .into());
@@ -642,6 +755,7 @@ fn parse_rotate_bitmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::escrow_fixtures::release_funds_borsh;
     use std::str::FromStr;
 
     // ============================================================================
@@ -654,42 +768,42 @@ mod tests {
         vec![42] // Just one byte for bump
     }
 
+    const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+    const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
+    const ALLOW_MINT_MIN_DEPOSIT_AMOUNT: u64 = 2_345_678;
+
     /// Create minimal valid Borsh-encoded data for AllowMint instruction
-    /// AllowMintIxData { bump: u8 }
+    /// AllowMintIxData { bump: u8, withdraw_fee: u64, min_withdraw_amount: u64,
+    /// min_deposit_amount: u64 }. The indexer does not read the deposit
+    /// minimum, so this pins that the trailing field still parses.
     fn create_allow_mint_borsh_data() -> Vec<u8> {
-        vec![123] // Just one byte for bump
+        let mut data = vec![123]; // bump
+        data.extend_from_slice(&ALLOW_MINT_WITHDRAW_FEE.to_le_bytes());
+        data.extend_from_slice(&ALLOW_MINT_MIN_WITHDRAW_AMOUNT.to_le_bytes());
+        data.extend_from_slice(&ALLOW_MINT_MIN_DEPOSIT_AMOUNT.to_le_bytes());
+        data
     }
 
-    /// Create valid inner instruction data for AllowMint event matching the actual program format
-    fn create_allow_mint_inner_instructions() -> Vec<InnerInstructions> {
+    /// An AllowMintEvent self-CPI for `mint` with `decimals`, emitted by the program at `program_id_index`.
+    fn allow_mint_event_inner(
+        program_id_index: u8,
+        mint: Pubkey,
+        decimals: u8,
+    ) -> InnerInstruction {
         let mut data = vec![];
-
-        // Event IX Tag (8 bytes)
-        data.extend_from_slice(&[0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d]);
-
-        // AllowMint discriminator (1 byte)
-        data.push(1);
-
-        // Instance seed (32 bytes) - dummy pubkey
-        data.extend_from_slice(&[0u8; 32]);
-
-        // Mint (32 bytes) - dummy pubkey
-        data.extend_from_slice(&[0u8; 32]);
-
-        // Decimals (1 byte)
-        data.push(2);
-
-        vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: ESCROW_PROGRAM_KEY_INDEX,
-                    accounts: vec![],
-                    data: bs58::encode(&data).into_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(ALLOW_MINT_EVENT_DISCRIMINATOR);
+        data.extend_from_slice(&[0u8; 32]); // instance_seed
+        data.extend_from_slice(mint.as_ref());
+        data.push(decimals);
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index,
+                accounts: vec![],
+                data: bs58::encode(&data).into_string(),
+            },
+            stack_height: Some(2),
+        }
     }
 
     /// Create minimal valid Borsh-encoded data for Deposit instruction
@@ -714,15 +828,6 @@ mod tests {
                 stack_height: Some(2),
             }],
         }]
-    }
-
-    /// Current ReleaseFunds argument bytes: amount, user, nonce.
-    fn create_release_funds_borsh_data(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
-        let mut data = vec![];
-        data.extend_from_slice(&amount.to_le_bytes());
-        data.extend_from_slice(user.as_ref());
-        data.extend_from_slice(&nonce.to_le_bytes());
-        data
     }
 
     /// Encode instruction data with discriminator and Borsh data as base58
@@ -822,11 +927,21 @@ mod tests {
         let instruction = create_instruction_with_accounts(11, "dummy".to_string());
         let account_keys = create_n_account_keys(11);
 
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                account_keys[3],
+                2,
+            )],
+        }];
+
         let result = parse_allow_mint(
             &borsh_data,
             &instruction,
             &account_keys,
-            &create_allow_mint_inner_instructions(),
+            &inner_sets,
+            InstructionLocation::top_level(0),
         );
 
         assert!(result.is_ok());
@@ -834,6 +949,8 @@ mod tests {
         assert!(parsed.is_some());
         if let Some(EscrowInstruction::AllowMint { data, .. }) = parsed {
             assert_eq!(data.bump, 123);
+            assert_eq!(data.withdraw_fee, ALLOW_MINT_WITHDRAW_FEE);
+            assert_eq!(data.min_withdraw_amount, ALLOW_MINT_MIN_WITHDRAW_AMOUNT);
         } else {
             panic!("Expected AllowMint instruction");
         }
@@ -844,12 +961,21 @@ mod tests {
         let borsh_data = create_allow_mint_borsh_data();
         let instruction = create_instruction_with_accounts(10, "dummy".to_string()); // Only 10 accounts (need 11)
         let account_keys = create_n_account_keys(10);
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                account_keys[3],
+                2,
+            )],
+        }];
 
         let result = parse_allow_mint(
             &borsh_data,
             &instruction,
             &account_keys,
-            &create_allow_mint_inner_instructions(),
+            &inner_sets,
+            InstructionLocation::top_level(0),
         );
 
         assert!(result.is_err());
@@ -863,11 +989,190 @@ mod tests {
         let instruction = create_instruction_with_accounts(11, "dummy".to_string());
         let account_keys = create_n_account_keys(11);
 
-        let result = parse_allow_mint(&borsh_data, &instruction, &account_keys, &[]);
+        let result = parse_allow_mint(
+            &borsh_data,
+            &instruction,
+            &account_keys,
+            &[],
+            InstructionLocation::top_level(0),
+        );
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("No allow mint event found"), "Error: {}", err);
+    }
+
+    /// Two top-level AllowMints in one tx each read their own inner set's event, not the first one in the tx.
+    #[test]
+    fn two_allow_mints_in_one_tx_read_their_own_decimals() {
+        let account_keys = create_n_account_keys(11);
+        // Keys pad to 21, so 12 is a spare key outside the instruction's 11 accounts.
+        let mint_b_key_index = 12;
+        let mint_a = account_keys[3];
+        let mint_b = account_keys[mint_b_key_index as usize];
+        let mint_a_decimals = 6;
+        let mint_b_decimals = 9;
+
+        let data = encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data());
+        let instruction_a = create_instruction_with_accounts(11, data.clone());
+        let mut instruction_b = create_instruction_with_accounts(11, data);
+        instruction_b.accounts[3] = mint_b_key_index;
+
+        let inner_sets = vec![
+            InnerInstructions {
+                index: 0,
+                instructions: vec![allow_mint_event_inner(
+                    ESCROW_PROGRAM_KEY_INDEX,
+                    mint_a,
+                    mint_a_decimals,
+                )],
+            },
+            InnerInstructions {
+                index: 1,
+                instructions: vec![allow_mint_event_inner(
+                    ESCROW_PROGRAM_KEY_INDEX,
+                    mint_b,
+                    mint_b_decimals,
+                )],
+            },
+        ];
+
+        let parsed_a = parse_escrow_instruction(
+            &instruction_a,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap()
+        .unwrap();
+        let parsed_b = parse_escrow_instruction(
+            &instruction_b,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(1),
+        )
+        .unwrap()
+        .unwrap();
+
+        let EscrowInstruction::AllowMint {
+            accounts: accounts_a,
+            event: event_a,
+            ..
+        } = parsed_a
+        else {
+            panic!("expected AllowMint");
+        };
+        let EscrowInstruction::AllowMint {
+            accounts: accounts_b,
+            event: event_b,
+            ..
+        } = parsed_b
+        else {
+            panic!("expected AllowMint");
+        };
+        assert_eq!(accounts_a.mint, mint_a);
+        assert_eq!(event_a.decimals, mint_a_decimals);
+        assert_eq!(accounts_b.mint, mint_b);
+        assert_eq!(
+            event_b.decimals, mint_b_decimals,
+            "mint B reads its own event, not mint A's"
+        );
+    }
+
+    /// An AllowMintEvent sitting in another top-level instruction's inner set is not read, even for the same mint.
+    #[test]
+    fn allow_mint_event_in_another_instructions_set_is_ignored() {
+        let account_keys = create_n_account_keys(11);
+        let instruction = create_instruction_with_accounts(
+            11,
+            encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data()),
+        );
+        // The only matching event belongs to top-level instruction 1, not 0.
+        let inner_sets = vec![InnerInstructions {
+            index: 1,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                account_keys[3],
+                6,
+            )],
+        }];
+
+        let err = parse_escrow_instruction(
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("No allow mint event found"),
+            "event outside the instruction's own inner set must be ignored: {err}"
+        );
+    }
+
+    /// An AllowMintEvent for a different mint than the instruction's is not read as its event.
+    #[test]
+    fn allow_mint_event_for_other_mint_is_ignored() {
+        let account_keys = create_n_account_keys(11);
+        // Keys pad to 21, so 12 is a spare key outside the instruction's 11 accounts.
+        let other_mint = account_keys[12];
+        let instruction = create_instruction_with_accounts(
+            11,
+            encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data()),
+        );
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                other_mint,
+                6,
+            )],
+        }];
+
+        let err = parse_escrow_instruction(
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("No allow mint event found"),
+            "event for another mint must be ignored: {err}"
+        );
+    }
+
+    /// An AllowMintEvent lookalike on a non-escrow program is not read as the event.
+    #[test]
+    fn allow_mint_foreign_program_event_lookalike_is_ignored() {
+        let account_keys = create_n_account_keys(11);
+        let instruction = create_instruction_with_accounts(
+            11,
+            encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data()),
+        );
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            // Key index 0 is not the escrow program.
+            instructions: vec![allow_mint_event_inner(0, account_keys[3], 6)],
+        }];
+
+        let err = parse_escrow_instruction(
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("No allow mint event found"),
+            "foreign-program event lookalike must be ignored: {err}"
+        );
     }
 
     // ============================================================================
@@ -1075,38 +1380,53 @@ mod tests {
 
     /// The bitmap sits at index 3 and pushes every later account along by one,
     /// so a wrong offset table would put the wrong nonce and amount in the
-    /// database rather than fail.
+    /// database rather than fail. 13 is pre-memo, 14 current, 17 with hook extras.
     #[test]
     fn test_release_funds_account_offsets() {
-        let user = Pubkey::new_unique();
-        let data = create_release_funds_borsh_data(1_000, user, 42);
-        let instruction = create_instruction_with_accounts(14, "dummy".to_string());
-        let account_keys = create_n_account_keys(14);
+        for n in [13, 14, 17] {
+            let user = Pubkey::new_unique();
+            let data = release_funds_borsh(1_000, user, 42);
+            let instruction = create_instruction_with_accounts(n, "dummy".to_string());
+            let keys = create_n_account_keys(n);
 
-        let parsed = parse_release_funds(&data, &instruction, &account_keys)
-            .expect("must parse")
-            .expect("must yield an instruction");
+            let parsed = parse_release_funds(&data, &instruction, &keys)
+                .unwrap_or_else(|e| panic!("{n} accounts must parse: {e}"))
+                .expect("must yield an instruction");
 
-        let EscrowInstruction::ReleaseFunds { accounts, data } = parsed else {
-            panic!("must decode as ReleaseFunds");
-        };
+            let EscrowInstruction::ReleaseFunds { accounts: a, data } = parsed else {
+                panic!("must decode as ReleaseFunds");
+            };
 
-        assert_eq!(data.amount, 1_000);
-        assert_eq!(data.transaction_nonce, 42);
-        assert_eq!(data.user, user);
-        assert_eq!(accounts.withdrawal_bitmap, account_keys[3]);
-        assert_eq!(accounts.operator_pda, account_keys[4]);
-        assert_eq!(accounts.private_channel_escrow_program, account_keys[12]);
+            assert_eq!(data.amount, 1_000, "{n} accounts");
+            assert_eq!(data.transaction_nonce, 42, "{n} accounts");
+            assert_eq!(data.user, user, "{n} accounts");
+            let resolved = [
+                a.payer,
+                a.operator,
+                a.instance,
+                a.withdrawal_bitmap,
+                a.operator_pda,
+                a.mint,
+                a.allowed_mint,
+                a.user_ata,
+                a.instance_ata,
+                a.token_program,
+                a.associated_token_program,
+                a.event_authority,
+                a.private_channel_escrow_program,
+            ];
+            assert_eq!(resolved, keys[..13], "{n} accounts");
+        }
     }
 
     /// Data shorter than the layout needs must error rather than read past the
     /// end or silently mis-slice.
     #[test]
     fn test_release_funds_malformed_data_errors() {
-        let mut data = create_release_funds_borsh_data(1_000, Pubkey::new_unique(), 42);
+        let mut data = release_funds_borsh(1_000, Pubkey::new_unique(), 42);
         data.truncate(40);
-        let instruction = create_instruction_with_accounts(14, "dummy".to_string());
-        let account_keys = create_n_account_keys(14);
+        let instruction = create_instruction_with_accounts(13, "dummy".to_string());
+        let account_keys = create_n_account_keys(13);
 
         let err = parse_release_funds(&data, &instruction, &account_keys)
             .expect_err("short data must not parse")
@@ -1116,15 +1436,17 @@ mod tests {
 
     #[test]
     fn test_release_funds_insufficient_accounts() {
-        let data = create_release_funds_borsh_data(1_000, Pubkey::new_unique(), 1);
-        let instruction = create_instruction_with_accounts(11, "dummy".to_string());
-        let account_keys = create_n_account_keys(11);
+        let data = release_funds_borsh(1_000, Pubkey::new_unique(), 1);
+        let instruction = create_instruction_with_accounts(12, "dummy".to_string());
+        let account_keys = create_n_account_keys(12);
 
-        let result = parse_release_funds(&data, &instruction, &account_keys);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Insufficient accounts"), "Error: {}", err);
+        let err = parse_release_funds(&data, &instruction, &account_keys)
+            .expect_err("12 accounts must not parse")
+            .to_string();
+        assert!(
+            err.contains("Insufficient accounts: required 13, actual 12"),
+            "Error: {err}"
+        );
     }
 
     // ============================================================================
@@ -1348,44 +1670,231 @@ mod tests {
         );
     }
 
-    /// A CPI deposit whose location carries no stack height can't be scoped to
-    /// its own subtree, so the parser errors (drops it) rather than risk reading
-    /// a neighbouring deposit's event amount.
-    #[test]
-    fn cpi_deposit_without_stack_height_errors_rather_than_guess() {
-        let borsh_data = create_deposit_borsh_data();
-        let instruction = create_instruction_with_accounts(12, "dummy".to_string());
-        let account_keys = create_n_account_keys(12);
+    // ============================================================================
+    // CPI deposit without stack height: positional fallback
+    // ============================================================================
 
-        // Two deposits share one set, so guessing would be ambiguous.
-        let inner_set = vec![InnerInstructions {
-            index: 4,
-            instructions: vec![
-                deposit_ix_inner(2),
-                deposit_event_inner(300, 3),
-                deposit_ix_inner(2),
-                deposit_event_inner(400, 3),
-            ],
-        }];
+    /// Instance seed whose PDA sits at key 2, the Deposit's instance account.
+    fn stackless_seed() -> Pubkey {
+        Pubkey::new_from_array([7u8; 32])
+    }
 
-        let result = parse_deposit(
-            &borsh_data,
-            &instruction,
-            &account_keys,
-            &inner_set,
+    /// Keys where user is key 1, instance is the seed's PDA (key 2) and mint is key 3.
+    fn stackless_keys() -> Vec<Pubkey> {
+        let mut keys = create_n_account_keys(12);
+        keys[2] = crate::operator::utils::account_util::find_instance_pda(&stackless_seed());
+        keys
+    }
+
+    /// An escrow DepositEvent with every field set and no stack height.
+    fn stackless_event(
+        instance_seed: Pubkey,
+        user: Pubkey,
+        amount: u64,
+        recipient: Pubkey,
+        mint: Pubkey,
+    ) -> InnerInstruction {
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: ESCROW_PROGRAM_KEY_INDEX,
+                accounts: vec![],
+                data: bs58::encode(
+                    crate::test_utils::escrow_fixtures::deposit_event_bytes_full(
+                        instance_seed,
+                        user,
+                        amount,
+                        recipient,
+                        mint,
+                    ),
+                )
+                .into_string(),
+            },
+            stack_height: None,
+        }
+    }
+
+    /// The event a Deposit with no recipient emits over `stackless_keys`.
+    fn bound_event(keys: &[Pubkey], amount: u64) -> InnerInstruction {
+        stackless_event(stackless_seed(), keys[1], amount, keys[1], keys[3])
+    }
+
+    /// An inner escrow Deposit instruction with no stack height.
+    fn stackless_deposit_ix() -> InnerInstruction {
+        InnerInstruction {
+            stack_height: None,
+            ..deposit_ix_inner(2)
+        }
+    }
+
+    /// A non-escrow entry (key 0) with no stack height, such as the token transfer.
+    fn stackless_foreign_ix() -> InnerInstruction {
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![],
+                data: "transfer".to_string(),
+            },
+            stack_height: None,
+        }
+    }
+
+    /// Parse the CPI deposit at `inner_index` of top-level set 4, with no stack height.
+    fn parse_stackless(
+        borsh_data: &[u8],
+        keys: &[Pubkey],
+        inner_set: &[InnerInstructions],
+        inner_index: u32,
+    ) -> Result<Option<EscrowInstruction>, ParserError> {
+        parse_deposit(
+            borsh_data,
+            &create_instruction_with_accounts(12, "dummy".to_string()),
+            keys,
+            inner_set,
             InstructionLocation {
                 top_level_index: 4,
                 inner: Some(InnerLocation {
-                    inner_index: 0,
+                    inner_index,
                     stack_height: None,
                 }),
             },
-        );
+        )
+    }
 
-        let err = result.unwrap_err().to_string();
+    fn deposit_amount_of(ix: EscrowInstruction) -> u64 {
+        match ix {
+            EscrowInstruction::Deposit { event, .. } => event.amount,
+            _ => panic!("expected Deposit"),
+        }
+    }
+
+    /// Two CPI deposits in one set, no stack heights: each reads the first escrow
+    /// entry after it, skipping the non-escrow token transfer in between.
+    #[test]
+    fn stackless_cpi_deposits_in_one_set_read_their_own_events() {
+        let keys = stackless_keys();
+        //   [0] deposit A  [1] token transfer  [2] event 300
+        //   [3] deposit B  [4] token transfer  [5] event 400
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![
+                stackless_deposit_ix(),
+                stackless_foreign_ix(),
+                bound_event(&keys, 300),
+                stackless_deposit_ix(),
+                stackless_foreign_ix(),
+                bound_event(&keys, 400),
+            ],
+        }];
+        let data = create_deposit_borsh_data();
+
+        let a = parse_stackless(&data, &keys, &inner_set, 0)
+            .unwrap()
+            .unwrap();
+        let b = parse_stackless(&data, &keys, &inner_set, 3)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(deposit_amount_of(a), 300, "deposit A reads its own event");
+        assert_eq!(deposit_amount_of(b), 400, "deposit B reads its own event");
+    }
+
+    /// An explicit recipient must match the event's recipient field.
+    #[test]
+    fn stackless_cpi_deposit_with_explicit_recipient_binds_it() {
+        let keys = stackless_keys();
+        let recipient = Pubkey::new_unique();
+        let data = crate::test_utils::escrow_fixtures::deposit_borsh(1000, Some(recipient));
+        let event = |r| stackless_event(stackless_seed(), keys[1], 250, r, keys[3]);
+        let set = |r| {
+            vec![InnerInstructions {
+                index: 4,
+                instructions: vec![stackless_deposit_ix(), event(r)],
+            }]
+        };
+
+        let ok = parse_stackless(&data, &keys, &set(recipient), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(deposit_amount_of(ok), 250);
+
+        // The event names the user, but the deposit asked for `recipient`.
+        let err = parse_stackless(&data, &keys, &set(keys[1]), 0)
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("cannot scope DepositEvent"),
-            "CPI deposit without stack height must error: {err}"
+            err.contains("recipient does not match"),
+            "explicit recipient mismatch must error: {err}"
+        );
+    }
+
+    /// Each identity field of the event must match the deposit, or the parse errors.
+    #[test]
+    fn stackless_cpi_deposit_rejects_event_that_does_not_match() {
+        let keys = stackless_keys();
+        let other = Pubkey::new_unique();
+        let (seed, user, mint) = (stackless_seed(), keys[1], keys[3]);
+        let cases = [
+            ("user", stackless_event(seed, other, 1, user, mint)),
+            ("mint", stackless_event(seed, user, 1, user, other)),
+            // No recipient in the deposit, so the event must name the user.
+            ("recipient", stackless_event(seed, user, 1, other, mint)),
+            ("instance", stackless_event(other, user, 1, user, mint)),
+        ];
+
+        for (field, event) in cases {
+            let inner_set = vec![InnerInstructions {
+                index: 4,
+                instructions: vec![stackless_deposit_ix(), event],
+            }];
+            let err = parse_stackless(&create_deposit_borsh_data(), &keys, &inner_set, 0)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{field} does not match")),
+                "{field} mismatch must error: {err}"
+            );
+        }
+    }
+
+    /// No escrow entry after the deposit means its event is missing, so the parse errors.
+    #[test]
+    fn stackless_cpi_deposit_without_escrow_entry_after_it_errors() {
+        let keys = stackless_keys();
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![stackless_deposit_ix(), stackless_foreign_ix()],
+        }];
+
+        let err = parse_stackless(&create_deposit_borsh_data(), &keys, &inner_set, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no escrow entry after it"),
+            "missing event must error: {err}"
+        );
+    }
+
+    /// A source that dropped deposit A's event shows deposit B as A's next escrow
+    /// entry. A must error, never borrow B's amount.
+    #[test]
+    fn stackless_cpi_deposit_with_dropped_event_errors_not_borrows() {
+        let keys = stackless_keys();
+        //   [0] deposit A  (event dropped)  [1] deposit B  [2] event 400
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![
+                stackless_deposit_ix(),
+                stackless_deposit_ix(),
+                bound_event(&keys, 400),
+            ],
+        }];
+
+        let err = parse_stackless(&create_deposit_borsh_data(), &keys, &inner_set, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a DepositEvent"),
+            "dropped event must error, not borrow the next deposit's: {err}"
         );
     }
 

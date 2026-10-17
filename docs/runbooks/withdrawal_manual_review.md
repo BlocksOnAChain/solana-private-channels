@@ -44,12 +44,15 @@ have prefixes.
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
+| `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
+| `refuses non-confidential credits` | A.non-halting | no | pre-flight |
 | `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `remint idempotency classification unavailable` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `but the bitmap is on generation` together with `no signatures to verify` | H - rotated past generation (use this, not C) | no | `sender/transaction.rs` |
+| `Max retries exceeded` together with `no signatures to verify` | I - retry budget spent with nothing broadcast (use this, not C) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
@@ -171,7 +174,9 @@ Note that parking is not a refund. `WithdrawFunds` burns the user's channel
 tokens before the row exists, and a row parked here never reaches the
 sender, so the compensating remint that normally restores those tokens
 after a permanent release failure never runs. Every disposition below has
-to say explicitly what the user is owed.
+to say explicitly what the user is owed. That is always the row's `amount`,
+never the withdraw fee: the fee was paid to the treasury, and refunding it
+would reopen the free retry loop it exists to close.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for this row. Expected: `NOT_LANDED` (pre-flight aborted before send).
@@ -214,6 +219,14 @@ to say explicitly what the user is owed.
      reminds their channel balance, so it lands in
      [withdrawal_failed_reminted.md](withdrawal_failed_reminted.md), not here.
      [Escalate](_escalation.md) (Tier 2).
+   - `refuses non-confidential credits` - the withdrawal's Solana destination is a
+     confidential-transfer account whose owner ran `DisableNonConfidentialCredits`, so
+     the release's transfer would fail on-chain after the operator paid for it. The
+     escrow still holds the funds. If the owner re-enables credits
+     (`EnableNonConfidentialCredits`), re-arm the row; the pre-flight reads the account
+     again. Otherwise refund the row's `amount` out-of-band. Several of these from the
+     same initiator is the retry loop the withdraw fee exists to price, so
+     [escalate](_escalation.md) (Tier 2) rather than refunding each one.
    - `withdrawals blocked for mint:` - an admin set the mint's withdrawal gate, which
      `release_funds` rejects on-chain. The escrow still holds the funds and the row is
      intact, so nothing is lost. Re-open the gate (`BlockMint` with
@@ -232,6 +245,18 @@ to say explicitly what the user is owed.
      exists. Expect every withdrawal of that mint to park here. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook validation account invalid for mint` - the mint's
+     `ExtraAccountMetaList` does not parse or cannot resolve. The escrow still
+     holds the funds and the row is intact. Two causes:
+     - The list itself is broken (for example, a seed reading past the
+       instruction data). Every withdrawal of that mint parks here, and only the
+       hook program can rewrite it, so contact the mint issuer.
+     - An account the hook seeds from is absent or too short right now (for
+       example, the recipient's token account does not exist yet, or the node
+       is behind). Only this row is affected.
+
+     Re-arm the row once. If it parks here again, or other rows of the mint do
+     too, treat it as the first case. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook accounts exceed the per-transfer cap` - the mint's
      `ExtraAccountMetaList` resolves to more accounts than a release transaction
      can carry. The message gives the count and the cap. The escrow still holds
@@ -606,6 +631,37 @@ coordination:
 ```sql
 UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
+```
+
+## Path I - retry budget spent with nothing broadcast
+
+`error_message` contains `Max retries exceeded` and `no signatures to verify`,
+and `pending_release_signatures` has no row for the transaction. The sender's
+per-nonce attempt counter reached `operator.retry_max_attempts`
+(`OPERATOR_RETRY_MAX_ATTEMPTS`) before any release was broadcast. There are two
+causes:
+
+- A zero budget. The operator now refuses to start with `retry_max_attempts = 0`,
+  but rows quarantined before that check existed are not repaired by a restart:
+  with no recorded signature the stalled-release reconciliation never picks them up.
+- Repeated build or sign failures, for example the blockhash RPC being down.
+  The counter survives a pre-broadcast requeue, so a small budget runs out.
+
+Nothing was broadcast for these rows.
+
+1. Find out why the attempts failed. Read the operator logs for the nonce
+   (`Transaction attempt n/m` and the build or sign error before each) and fix that
+   cause first. For a zero budget, confirm the running operator has
+   `retry_max_attempts` of at least 1.
+2. Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
+   verdict: `NOT_LANDED`. If `LANDED`, switch to Path C.
+3. Re-arm the row so the operator sends it again:
+
+```sql
+UPDATE transactions
+   SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id
+   AND status = 'manual_review';
 ```
 
 ## Path H - rotated past generation

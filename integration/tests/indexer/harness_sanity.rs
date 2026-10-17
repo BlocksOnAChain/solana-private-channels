@@ -7,9 +7,9 @@
 //!     task, wires its RPC client at `mock.url()`, and backs its storage
 //!     with `Storage::Mock`.
 //!   - Seeding one pending `Deposit` row into
-//!     `harness.storage.pending_transactions` is enough for the fetcher to
-//!     pick it up, the processor to build a MintTo, and the sender to drive
-//!     through to `sendTransaction`.
+//!     `harness.storage.pending_transactions`, plus an escrow checkpoint that
+//!     covers its slot, is enough for the fetcher to pick it up, the processor
+//!     to build a MintTo, and the sender to drive through to `sendTransaction`.
 //!   - Scripted RPC replies (`getLatestBlockhash`, `getSignaturesForAddress`,
 //!     `sendTransaction`, and a transient-then-success
 //!     `getSignatureStatuses` sequence) are consumed in FIFO order.
@@ -173,7 +173,12 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     // production AllowMint dual-write.
     harness.storage.mints.lock().unwrap().insert(
         mint_pk.to_string(),
-        DbMint::new(mint_pk.to_string(), 6, spl_token::id().to_string()),
+        DbMint::new(
+            mint_pk.to_string(),
+            6,
+            spl_token::id().to_string(),
+            TokenAmount(1),
+        ),
     );
     harness
         .storage
@@ -185,10 +190,14 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
             mint_address: mint_pk.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_pk}"),
             created_at: chrono::Utc::now(),
         });
 
+    harness.storage.set_checkpoint("escrow", 100);
     harness
         .storage
         .pending_transactions

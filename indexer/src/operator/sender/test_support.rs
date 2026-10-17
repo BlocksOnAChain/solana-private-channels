@@ -31,7 +31,7 @@ use tokio::sync::Semaphore;
 /// Anything that builds a real instruction reaches `SignerUtil`, which panics
 /// when no signer is configured. The key itself is never checked, so a fresh
 /// throwaway keypair is enough to let those paths run.
-pub(super) fn ensure_test_signer() {
+pub(crate) fn ensure_test_signer() {
     static INIT_TEST_SIGNER: Once = Once::new();
     INIT_TEST_SIGNER.call_once(|| {
         let keypair = solana_sdk::signer::keypair::Keypair::new();
@@ -99,6 +99,9 @@ pub(super) fn sender_state_with_storage_and_role(
         pending_signatures: HashMap::new(),
         release_leases: HashMap::new(),
         pending_remints: Vec::new(),
+        remint_backlog_cursor: None,
+        remint_runtime_ids: HashSet::new(),
+        remint_backlog_unloaded: 0,
         in_flight: InFlightQueue::new(),
         semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
     }

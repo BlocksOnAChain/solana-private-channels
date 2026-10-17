@@ -11,10 +11,8 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_commitment_config::CommitmentLevel;
 use solana_sdk::{
-    hash::Hash, pubkey::Pubkey, signature::Keypair, signature::Signature, signer::Signer,
-    transaction::Transaction,
+    hash::Hash, signature::Keypair, signature::Signature, signer::Signer, transaction::Transaction,
 };
-use solana_system_interface::instruction as system_instruction;
 use solana_transaction_status::UiTransactionEncoding;
 use std::{net::TcpListener, sync::Arc, time::Duration};
 use testcontainers::runners::AsyncRunner;
@@ -125,12 +123,16 @@ async fn start_node_on(pg_url: &str, max_blockhashes: usize) -> Result<TestNode>
     panic!("node never produced a block at {url}");
 }
 
-/// A distinct System transfer bearing `blockhash`. Execution is gasless, so a
-/// fresh payer still settles, which makes each probe observable by signature.
+/// A distinct memo bearing `blockhash`. Execution is gasless, so a fresh payer
+/// still settles, which makes each probe observable by signature.
 fn client_transaction(blockhash: Hash) -> Transaction {
     let payer = Keypair::new();
-    let transfer = system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1);
-    Transaction::new_signed_with_payer(&[transfer], Some(&payer.pubkey()), &[&payer], blockhash)
+    let memo = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"sparse-chain".to_vec(),
+    };
+    Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[&payer], blockhash)
 }
 
 /// Submit without preflight. Preflight would reject a stale blockhash in the
@@ -145,6 +147,33 @@ async fn submit(client: &RpcClient, tx: &Transaction) -> Result<Signature> {
             },
         )
         .await?)
+}
+
+/// isBlockhashValid, with `None` for the retryable "catching up" answer that a
+/// block cut in progress gives for the hash it is about to expire.
+async fn blockhash_answer(client: &RpcClient, blockhash: &Hash) -> Result<Option<bool>> {
+    match client
+        .is_blockhash_valid(blockhash, client.commitment())
+        .await
+    {
+        Ok(valid) => Ok(Some(valid)),
+        Err(e) if e.to_string().contains("catching up") => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// isBlockhashValid, retried while the node says its window is catching up.
+async fn blockhash_is_valid(client: &RpcClient, blockhash: &Hash) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + HEARTBEAT * 3;
+    loop {
+        match blockhash_answer(client, blockhash).await? {
+            Some(valid) => return Ok(valid),
+            None if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(10)).await
+            }
+            None => anyhow::bail!("isBlockhashValid kept answering catching up"),
+        }
+    }
 }
 
 /// Poll `getSignatureStatuses` the way a confirmation loop does. False means the
@@ -283,10 +312,11 @@ async fn a_blockhash_expires_after_max_blockhashes_blocks() -> Result<()> {
     loop {
         let height = node.client.get_block_height().await?;
         if height == last_valid_block_height {
-            assert!(
-                node.client
-                    .is_blockhash_valid(&blockhash, node.client.commitment())
-                    .await?,
+            // "Catching up" means the next block is being cut and the answer is
+            // not final yet, which is still not dead.
+            assert_ne!(
+                blockhash_answer(&node.client, &blockhash).await?,
+                Some(false),
                 "the hash must still be live at its own lastValidBlockHeight"
             );
             break;
@@ -318,10 +348,7 @@ async fn a_blockhash_expires_after_max_blockhashes_blocks() -> Result<()> {
     };
 
     assert!(
-        !node
-            .client
-            .is_blockhash_valid(&blockhash, node.client.commitment())
-            .await?,
+        !blockhash_is_valid(&node.client, &blockhash).await?,
         "a hash past its lastValidBlockHeight must have left the window"
     );
 
@@ -497,9 +524,7 @@ async fn stock_client_confirmation_loop_terminates() -> Result<()> {
         sleep(Duration::from_millis(50)).await;
     };
     assert!(
-        !client
-            .is_blockhash_valid(&blockhash, client.commitment())
-            .await?,
+        !blockhash_is_valid(client, &blockhash).await?,
         "a hash past its lastValidBlockHeight must have left the window"
     );
     let after_deadline = submit(client, &client_transaction(blockhash)).await?;
@@ -778,11 +803,7 @@ async fn an_original_that_expires_in_a_stalled_preload_does_not_land() -> Result
     // The heartbeat keeps minting blocks past the parked transaction's hash.
     let deadline = tokio::time::Instant::now() + HEARTBEAT * 3;
     loop {
-        if !node
-            .client
-            .is_blockhash_valid(&blockhash, node.client.commitment())
-            .await?
-        {
+        if !blockhash_is_valid(&node.client, &blockhash).await? {
             break;
         }
         assert!(

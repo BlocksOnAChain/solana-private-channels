@@ -3,7 +3,8 @@ use super::types::InFlightQueue;
 use super::types::SenderState;
 use crate::config::ProgramType;
 use crate::metrics::{
-    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
+    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_PENDING_REMINTS, OPERATOR_RELEASE_VERIFY,
+    OPERATOR_REMINT_CLAIM_LOST, OPERATOR_TRANSACTION_ERRORS,
 };
 use crate::operator::sender::{release_seen_at_confirmed, verify_release_landed, ReleaseVerdict};
 use crate::{
@@ -30,11 +31,24 @@ use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Cap on total deferrals of a single pending remint. Covers both transient
-/// RPC errors during the finality check AND liveness extensions when a stored
-/// signature is still within blockhash validity. Past this cap we escalate
-/// to ManualReview rather than loop indefinitely.
+/// Cap on charged deferrals of a single pending remint: checks that could not
+/// answer, plus expected waits once `MAX_FREE_WAITS` is spent. Past this cap we
+/// escalate to ManualReview rather than loop indefinitely.
 const MAX_FINALITY_CHECK_ATTEMPTS: u32 = 3;
+
+/// Cap on expected waits that do not charge the attempt counter, about 10 minutes
+/// at one check per `FINALITY_SAFETY_DELAY`. Far above normal finality and indexer
+/// lag, but a wait that never clears still ends in ManualReview.
+const MAX_FREE_WAITS: u32 = 20;
+
+/// Cap on matured entries one tick processes, so a backlog cannot hold the sender loop.
+const MAX_REMINTS_PER_TICK: usize = 16;
+
+/// Time after which a tick starts no new entry, so slow RPC cannot hold the sender loop for long.
+const REMINT_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Rows loaded per page of the durable backlog, so memory stays bounded at boot and after.
+pub(super) const REMINT_HYDRATE_PAGE: usize = 256;
 
 /// Outcome of a single `attempt_remint` call.
 enum RemintAttempt {
@@ -354,6 +368,7 @@ pub async fn execute_deferred_remint(
                     error_message: Some(entry.original_error.clone()),
                     remint_signature: Some(signature.to_string()),
                     remint_attempted: true,
+                    alert_only: false,
                 },
                 "transaction status update",
             )
@@ -389,6 +404,7 @@ pub async fn execute_deferred_remint(
                         error_message: Some(combined),
                         remint_signature: None,
                         remint_attempted: true,
+                        alert_only: false,
                     },
                     "transaction status update",
                 )
@@ -490,6 +506,8 @@ enum EndpointVerdict {
         /// Lowest journaled blockhash slot across those signatures, the exact
         /// bottom of the range. `None` if any of them predates the column.
         min_blockhash_slot: Option<u64>,
+        /// Ledger floor from the same snapshot as the statuses; `None` means read it separately.
+        floor: Option<u64>,
     },
 }
 
@@ -497,11 +515,8 @@ enum EndpointVerdict {
 /// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
 /// proves retention.
 ///
-/// Sound on one endpoint whose state only moves forward, such as a lagging replica: height
-/// is read before status and the floor after, so no answer comes from an older state than
-/// the one before it. The channel's read cache keeps this, since it serves getBlockHeight
-/// from Postgres, the store that answers a status miss. Not sound behind a load balancer
-/// whose backends can disagree.
+/// Channel proofs read height, statuses and floor from one snapshot, so they hold on any topology.
+/// Solana proofs read them in order (height, status, floor) and need one forward-only endpoint.
 ///
 /// The bottom of the range is the slot the attempt's blockhash was read at, journaled
 /// with the broadcast. An attempt journaled before that column existed carries none, and
@@ -519,6 +534,7 @@ async fn ledger_coverage_verdict(
     rpc: &RpcClientWithRetry,
     min_lvbh: u64,
     min_blockhash_slot: Option<u64>,
+    snapshot_floor: Option<u64>,
     endpoint_label: &str,
 ) -> SigFinality {
     let chain = finality.chain.chain_label();
@@ -536,7 +552,11 @@ async fn ledger_coverage_verdict(
             ));
         }
     };
-    let floor = match rpc.get_first_available_block().await {
+    let floor = match snapshot_floor {
+        Some(floor) => Ok(floor),
+        None => rpc.get_first_available_block().await,
+    };
+    let floor = match floor {
         Ok(floor) => floor,
         Err(e) => {
             OPERATOR_ABSENCE_CLASSIFY
@@ -580,8 +600,8 @@ pub(crate) async fn classify_signatures(
     finality: &FinalityRpc<'_>,
     sigs: &[PendingSig],
 ) -> SigFinality {
-    let (primary_lvbh, primary_blockhash_slot) =
-        match classify_endpoint(finality.primary, sigs).await {
+    let (primary_lvbh, primary_blockhash_slot, primary_floor) =
+        match classify_endpoint(finality.primary, finality.chain, sigs).await {
             EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
             EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
             EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
@@ -591,14 +611,15 @@ pub(crate) async fn classify_signatures(
             EndpointVerdict::DeadByAbsence {
                 min_lvbh,
                 min_blockhash_slot,
-            } => (min_lvbh, min_blockhash_slot),
+                floor,
+            } => (min_lvbh, min_blockhash_slot, floor),
         };
 
     match finality.fallback {
         // Destination path: the primary is allowed to be pruned (that is why the
         // fallback exists), so we trust the fallback's verdict and coverage-check
         // the fallback, never the primary.
-        Some(fb) => match classify_endpoint(fb, sigs).await {
+        Some(fb) => match classify_endpoint(fb, finality.chain, sigs).await {
             EndpointVerdict::Landed(sig) => {
                 warn_fallback_override("Landed", &sig.to_string(), sigs);
                 SigFinality::Landed(sig)
@@ -612,9 +633,17 @@ pub(crate) async fn classify_signatures(
             EndpointVerdict::DeadByAbsence {
                 min_lvbh,
                 min_blockhash_slot,
+                floor,
             } => {
-                ledger_coverage_verdict(finality, fb, min_lvbh, min_blockhash_slot, "fallback ")
-                    .await
+                ledger_coverage_verdict(
+                    finality,
+                    fb,
+                    min_lvbh,
+                    min_blockhash_slot,
+                    floor,
+                    "fallback ",
+                )
+                .await
             }
         },
         // Source/escrow single endpoint: no second node can corroborate, so the
@@ -625,6 +654,7 @@ pub(crate) async fn classify_signatures(
                 finality.primary,
                 primary_lvbh,
                 primary_blockhash_slot,
+                primary_floor,
                 "",
             )
             .await
@@ -637,7 +667,7 @@ pub(crate) async fn classify_signatures(
 /// coverage gate `classify_signatures` adds.
 #[cfg(test)]
 pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
-    match classify_endpoint(rpc, sigs).await {
+    match classify_endpoint(rpc, Chain::Solana, sigs).await {
         EndpointVerdict::Landed(sig) => SigFinality::Landed(sig),
         EndpointVerdict::Live(reason) => SigFinality::Live(reason),
         EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
@@ -647,35 +677,55 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
     }
 }
 
-/// Classify `sigs` against one endpoint's `getSignatureStatuses` history, distinguishing a
-/// finalized-failed `Dead` from an absence-based one so only the latter needs a proof.
-async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
+/// Classify `sigs` on one endpoint, telling a finalized-failed `Dead` from an unproven absence.
+async fn classify_endpoint(
+    rpc: &RpcClientWithRetry,
+    chain: Chain,
+    sigs: &[PendingSig],
+) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
-    // Height before status: on an endpoint whose state only moves forward, the status
-    // then comes from a state at least as new, so a null is never paired with an expiry
-    // its own view had not reached. Held as a Result so an outage only matters below.
-    let block_height = rpc.get_block_height().await;
-
-    let response = match rpc.get_signature_statuses_with_history(&flat).await {
-        Ok(r) => r,
-        Err(e) => {
-            return EndpointVerdict::Uncertain(format!("signature status RPC failed: {}", e));
+    let (block_height, statuses, snapshot_floor) = match chain {
+        // One snapshot, and no fallback to separate reads that could mix states.
+        Chain::Channel => match rpc.get_signature_status_snapshot(&flat).await {
+            Ok(snapshot) => (
+                Ok(snapshot.block_height),
+                snapshot.value,
+                Some(snapshot.first_available_block),
+            ),
+            Err(e) => {
+                return EndpointVerdict::Uncertain(format!(
+                    "signature status snapshot RPC failed: {e}"
+                ));
+            }
+        },
+        Chain::Solana => {
+            // Height before status, so a null never comes from an older state than its height.
+            let block_height = rpc.get_block_height().await.map_err(|e| e.to_string());
+            match rpc.get_signature_statuses_with_history(&flat).await {
+                Ok(response) => (block_height, response.value, None),
+                Err(e) => {
+                    return EndpointVerdict::Uncertain(format!(
+                        "signature status RPC failed: {}",
+                        e
+                    ));
+                }
+            }
         }
     };
 
     // RPC returns one status per signature in order; a length mismatch would
     // silently skip checks below, so treat it as uncertain.
-    if response.value.len() != flat.len() {
+    if statuses.len() != flat.len() {
         return EndpointVerdict::Uncertain(format!(
             "RPC returned {} statuses for {} signatures",
-            response.value.len(),
+            statuses.len(),
             flat.len()
         ));
     }
 
     // Any sig finalized successfully → the release landed.
-    let finalized_success_index = response.value.iter().position(|signature_status| {
+    let finalized_success_index = statuses.iter().position(|signature_status| {
         signature_status.as_ref().is_some_and(|status| {
             status.satisfies_commitment(CommitmentConfig::finalized()) && status.err.is_none()
         })
@@ -686,7 +736,7 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
 
     // Block height is needed only for the lvbh check on null-status sigs, so a
     // transient getBlockHeight outage isn't treated as uncertainty otherwise.
-    let current_height = if response.value.iter().any(|s| s.is_none()) {
+    let current_height = if statuses.iter().any(|s| s.is_none()) {
         match block_height {
             Ok(h) => h,
             Err(e) => {
@@ -706,9 +756,9 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
     let mut min_absent_blockhash_slot: Option<u64> = None;
     let mut absent_slot_unknown = false;
 
-    // Walk the sigs to see if any could still land (index-aligned with response.value).
+    // Walk the sigs to see if any could still land (index-aligned with statuses).
     for (index, pending_sig) in sigs.iter().enumerate() {
-        let signature_status = &response.value[index];
+        let signature_status = &statuses[index];
 
         if let Some(status) = signature_status.as_ref() {
             // Only `finalized` is definitive; success was handled above, so this is failure.
@@ -755,14 +805,15 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
         Some(min_lvbh) => EndpointVerdict::DeadByAbsence {
             min_lvbh,
             min_blockhash_slot: min_absent_blockhash_slot,
+            floor: snapshot_floor,
         },
         // No absence: every sig carried a finalized-failed status.
         None => EndpointVerdict::DeadFinalizedFailure,
     }
 }
 
-/// Process matured entries in the deferred remint queue. For each matured
-/// entry, classify the stored withdrawal signatures and pick one of:
+/// Process up to `MAX_REMINTS_PER_TICK` matured entries in the deferred remint
+/// queue, starting none after `REMINT_TICK_BUDGET`. For each one, classify the stored withdrawal signatures and pick one of:
 ///   1. Any sig finalized + success → report Completed.
 ///   2. Any sig still live (has a non-finalized status entry, OR has no
 ///      status entry but still within blockhash validity)
@@ -776,15 +827,38 @@ pub async fn process_pending_remints(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
+    process_pending_remints_within(state, storage_tx, REMINT_TICK_BUDGET).await;
+}
+
+async fn process_pending_remints_within(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    budget: std::time::Duration,
+) {
     // Deferred remints are Withdraw-only; another role would classify the
     // release signatures against the wrong chain.
     if state.program_type != ProgramType::Withdraw {
         return;
     }
 
+    // Top up from the durable backlog. A read error must not stop the sender loop, and the
+    // cursor only moves on success, so the next tick retries the same page.
+    if state.queued_backlog_remints() < REMINT_HYDRATE_PAGE {
+        if let Err(e) = state.hydrate_pending_remints(storage_tx).await {
+            // Counted so a read that keeps failing raises an alert instead of stalling refunds quietly.
+            OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    state.program_type.as_label(),
+                    "pending_remint_page_read_failed",
+                ])
+                .inc();
+            error!("Pending remint page read failed, retrying next tick: {e}");
+        }
+    }
+
     let now = Utc::now();
 
-    // Drain the queue and split: due now vs. wait longer.
+    // Drain the queue and split: due now vs. wait longer, then cap the due set.
     let mut remaining = Vec::new();
     let mut matured = Vec::new();
     for entry in state.pending_remints.drain(..) {
@@ -794,9 +868,21 @@ pub async fn process_pending_remints(
             remaining.push(entry);
         }
     }
+    // Keep the oldest deadlines in linear time; past the cap, entries wait unchanged for the next tick.
+    if matured.len() > MAX_REMINTS_PER_TICK {
+        matured.select_nth_unstable_by_key(MAX_REMINTS_PER_TICK, |entry| entry.deadline);
+        remaining.extend(matured.drain(MAX_REMINTS_PER_TICK..));
+    }
+    matured.sort_by_key(|entry| entry.deadline);
 
     // Each matured entry leaves the queue unless we push it back into `remaining`.
-    for mut entry in matured {
+    let started = std::time::Instant::now();
+    for (i, mut entry) in matured.into_iter().enumerate() {
+        // Past the budget the rest wait unchanged; the first entry always runs so the queue moves.
+        if i > 0 && started.elapsed() >= budget {
+            remaining.push(entry);
+            continue;
+        }
         let nonce_label = entry
             .ctx
             .withdrawal_nonce
@@ -813,6 +899,10 @@ pub async fn process_pending_remints(
                 send_completed(storage_tx, &entry, &nonce_label, sig).await;
             }
             // Case 2: could still land or unclassifiable → defer, don't remint.
+            // Waiting out a blockhash is expected, so it must not spend the attempts.
+            SigFinality::Live(reason) if entry.free_waits < MAX_FREE_WAITS => {
+                requeue_free_wait(&mut remaining, entry, &nonce_label, &reason);
+            }
             SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
                 defer_or_escalate(
                     &mut remaining,
@@ -846,7 +936,15 @@ pub async fn process_pending_remints(
                     )
                     .await;
                 }
-                BitmapVerdict::Unknown(reason) if !entry.release_refused_on_chain => {
+                // Waiting for finality to pass the attempt's blockhash is expected, like Live.
+                BitmapVerdict::Pending(reason)
+                    if !entry.release_refused_on_chain && entry.free_waits < MAX_FREE_WAITS =>
+                {
+                    requeue_free_wait(&mut remaining, entry, &nonce_label, &reason);
+                }
+                BitmapVerdict::Unknown(reason) | BitmapVerdict::Pending(reason)
+                    if !entry.release_refused_on_chain =>
+                {
                     defer_or_escalate(
                         &mut remaining,
                         entry,
@@ -858,15 +956,19 @@ pub async fn process_pending_remints(
                     .await;
                 }
                 // The payout record is the last gate, and the only one whose answer survives a rotation.
-                BitmapVerdict::Unknown(_) | BitmapVerdict::Clear => {
+                BitmapVerdict::Unknown(_) | BitmapVerdict::Pending(_) | BitmapVerdict::Clear => {
                     match release_record(state, &mut entry).await {
                         ReleaseRecord::Found(reason) => {
                             error!("Refusing to remint nonce {}: {}", nonce_label, reason);
                             send_manual_review(storage_tx, &entry, &reason).await;
                         }
+                        // Normal indexer lag must not spend the attempts the other gates share.
+                        ReleaseRecord::CatchingUp(reason) if entry.free_waits < MAX_FREE_WAITS => {
+                            requeue_free_wait(&mut remaining, entry, &nonce_label, &reason);
+                        }
                         // The indexer normally catches up in seconds, so waiting
                         // costs a tick where escalating costs a person.
-                        ReleaseRecord::Unproven(reason) => {
+                        ReleaseRecord::CatchingUp(reason) | ReleaseRecord::Unproven(reason) => {
                             defer_or_escalate(
                                 &mut remaining,
                                 entry,
@@ -919,6 +1021,9 @@ pub async fn process_pending_remints(
     // `remaining` = entries not yet due + entries re-queued by `defer_or_escalate`
     // or `requeue_in_flight`.
     state.pending_remints = remaining;
+    OPERATOR_PENDING_REMINTS
+        .with_label_values(&[state.program_type.as_label()])
+        .set(state.remint_backlog_size() as f64);
 }
 
 /// What the chain can tell us about a nonce at the instant before a remint.
@@ -936,6 +1041,8 @@ enum BitmapVerdict {
     Unknown(String),
     /// Set at confirmed but not yet finalized. Only finality settles it, so this always waits.
     Unfinalized(String),
+    /// Finality has not passed the attempt's validity window yet, an expected wait.
+    Pending(String),
 }
 
 /// Ask the chain whether this nonce was actually released before crediting the
@@ -972,7 +1079,7 @@ async fn bitmap_verdict(state: &SenderState, entry: &PendingRemint) -> BitmapVer
     let label = match &verdict {
         ReleaseVerdict::Landed { .. } => "landed",
         ReleaseVerdict::NotLanded => "not_landed",
-        ReleaseVerdict::Uncertain(_) => "uncertain",
+        ReleaseVerdict::Uncertain(_) | ReleaseVerdict::Pending(_) => "uncertain",
     };
     OPERATOR_RELEASE_VERIFY
         .with_label_values(&["remint", label])
@@ -1007,6 +1114,7 @@ async fn bitmap_verdict(state: &SenderState, entry: &PendingRemint) -> BitmapVer
             warn!("Could not prove nonce {nonce} unreleased before reminting: {reason}");
             BitmapVerdict::Unknown(reason)
         }
+        ReleaseVerdict::Pending(reason) => BitmapVerdict::Pending(reason),
     }
 }
 
@@ -1020,12 +1128,16 @@ enum ReleaseRecord {
     Found(String),
     /// Every slot a release could sit in is indexed, and none holds one.
     ProvenAbsent,
+    /// No row, and the record is not yet known to cover the window, but it is moving toward it.
+    CatchingUp(String),
     /// No row, but the record is not known to cover the window in question.
     Unproven(String),
 }
 
 enum ReleaseCoverage {
     Covered,
+    /// Behind the bound, but the checkpoint moved since the last read, or this is the first read.
+    CatchingUp(String),
     Unproven(String),
 }
 
@@ -1064,6 +1176,7 @@ async fn release_record(state: &SenderState, entry: &mut PendingRemint) -> Relea
 
     match coverage {
         ReleaseCoverage::Covered => ReleaseRecord::ProvenAbsent,
+        ReleaseCoverage::CatchingUp(reason) => ReleaseRecord::CatchingUp(reason),
         ReleaseCoverage::Unproven(reason) => ReleaseRecord::Unproven(reason),
     }
 }
@@ -1098,10 +1211,22 @@ async fn release_coverage(
         .await
     {
         Ok(Some(checkpoint)) if checkpoint >= bound => ReleaseCoverage::Covered,
-        Ok(Some(checkpoint)) => ReleaseCoverage::Unproven(format!(
-            "no release is on record for nonce {nonce}, but the indexer has only reached slot \
-             {checkpoint} of {bound}, so a release could still be unindexed"
-        )),
+        Ok(Some(checkpoint)) => {
+            // Only a moving checkpoint is lag; one that stopped is a stuck indexer and is charged.
+            let advanced = entry
+                .coverage_checkpoint
+                .is_none_or(|seen| checkpoint > seen);
+            entry.coverage_checkpoint = Some(checkpoint);
+            let reason = format!(
+                "no release is on record for nonce {nonce}, but the indexer has only reached slot \
+                 {checkpoint} of {bound}, so a release could still be unindexed"
+            );
+            if advanced {
+                ReleaseCoverage::CatchingUp(reason)
+            } else {
+                ReleaseCoverage::Unproven(reason)
+            }
+        }
         Ok(None) => ReleaseCoverage::Unproven(format!(
             "no release is on record for nonce {nonce} and the indexer has committed no \
              checkpoint, so nothing says the record covers slot {bound}"
@@ -1135,6 +1260,7 @@ async fn send_manual_review(
             error_message: Some(format!("{} | {}", entry.original_error, reason)),
             remint_signature: None,
             remint_attempted: false,
+            alert_only: false,
         },
         "transaction status update",
     )
@@ -1175,6 +1301,7 @@ async fn send_completed(
             error_message: None,
             remint_signature: None,
             remint_attempted: false,
+            alert_only: false,
         },
         "transaction status update",
     )
@@ -1215,6 +1342,7 @@ async fn defer_or_escalate(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    alert_only: false,
                 },
                 "transaction status update",
             )
@@ -1252,6 +1380,7 @@ async fn defer_or_escalate(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    alert_only: false,
                 },
                 "transaction status update",
             )
@@ -1288,6 +1417,28 @@ fn requeue_in_flight(
     );
     remaining.push(PendingRemint {
         deadline: new_deadline,
+        ..entry
+    });
+}
+
+/// Re-queue an entry on an expected wait: blockhash validity, finality or indexer lag.
+/// Neither charged nor persisted, so normal lag cannot push it into ManualReview;
+/// `MAX_FREE_WAITS` still bounds how long it can wait this way.
+fn requeue_free_wait(
+    remaining: &mut Vec<PendingRemint>,
+    entry: PendingRemint,
+    nonce_label: &str,
+    reason: &str,
+) {
+    let new_deadline = Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap();
+    let free_waits = entry.free_waits + 1;
+    info!(
+        "Pending remint for nonce {} waiting (free wait {}/{}): {}",
+        nonce_label, free_waits, MAX_FREE_WAITS, reason
+    );
+    remaining.push(PendingRemint {
+        deadline: new_deadline,
+        free_waits,
         ..entry
     });
 }
@@ -1361,6 +1512,9 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1501,10 +1655,46 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
         (state, mock)
+    }
+
+    /// A withdrawal remint entry due at `deadline`, with two journaled signatures.
+    fn matured_entry(id: i64, nonce: u64, deadline: chrono::DateTime<Utc>) -> PendingRemint {
+        PendingRemint {
+            ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
+                transaction_id: Some(id),
+                withdrawal_nonce: Some(nonce),
+                trace_id: Some(format!("trace-{id}")),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(id),
+            signatures: vec![
+                PendingSig {
+                    signature: Signature::new_unique(),
+                    last_valid_block_height: 0,
+                    blockhash_slot: None,
+                },
+                PendingSig {
+                    signature: Signature::new_unique(),
+                    last_valid_block_height: 0,
+                    blockhash_slot: None,
+                },
+            ],
+            original_error: "release_funds failed".to_string(),
+            deadline,
+            finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
+        }
     }
 
     /// Register a mockito response for a specific Solana RPC method.
@@ -1568,6 +1758,9 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1651,6 +1844,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1699,6 +1894,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1744,6 +1941,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1801,6 +2000,8 @@ mod tests {
             finality_check_attempts: 1,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1854,6 +2055,8 @@ mod tests {
             finality_check_attempts: 2, // MAX_FINALITY_CHECK_ATTEMPTS - 1
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1884,6 +2087,112 @@ mod tests {
             state.pending_remints.is_empty(),
             "should not re-queue after max attempts"
         );
+    }
+
+    /// One tick handles at most the cap, oldest deadline first, and leaves the overflow
+    /// untouched for the next tick.
+    #[tokio::test]
+    async fn process_pending_remints_handles_at_most_the_cap_per_tick() {
+        let mut server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(64);
+        // Fewer statuses than signatures makes every entry Uncertain, so each one defers.
+        let _status = mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_rpc(
+            &mut server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        let total = MAX_REMINTS_PER_TICK + 1;
+        let base = Utc::now() - chrono::Duration::seconds(600);
+        for i in 0..total {
+            let id = 100 + i as i64;
+            seed_pending_remint_row(&mock, id, 0);
+            // Pushed newest first so the cap has to pick by deadline, not by position.
+            let deadline = base + chrono::Duration::seconds((total - i) as i64);
+            state
+                .pending_remints
+                .push(matured_entry(id, id as u64, deadline));
+        }
+        let newest_id = 100;
+        let newest_deadline = state.pending_remints[0].deadline;
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(storage_rx.try_recv().is_err(), "deferrals write no status");
+        assert_eq!(state.pending_remints.len(), total);
+        let handled = state
+            .pending_remints
+            .iter()
+            .filter(|e| e.finality_check_attempts == 1)
+            .count();
+        assert_eq!(handled, MAX_REMINTS_PER_TICK);
+        let leftover = state
+            .pending_remints
+            .iter()
+            .find(|e| e.ctx.transaction_id == Some(newest_id))
+            .expect("leftover stays queued");
+        assert_eq!(leftover.finality_check_attempts, 0);
+        assert_eq!(leftover.deadline, newest_deadline);
+
+        // The re-queued entries are no longer due, so the leftover goes next tick.
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let leftover = state
+            .pending_remints
+            .iter()
+            .find(|e| e.ctx.transaction_id == Some(newest_id))
+            .expect("leftover stays queued");
+        assert_eq!(leftover.finality_check_attempts, 1);
+    }
+
+    /// Once the time budget is spent no new entry starts, but the oldest one always runs.
+    #[tokio::test]
+    async fn process_pending_remints_starts_no_entry_past_the_time_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        let (storage_tx, _storage_rx) = mpsc::channel(64);
+        let _status = mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_rpc(
+            &mut server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        let base = Utc::now() - chrono::Duration::seconds(600);
+        for i in 0..3i64 {
+            let id = 100 + i;
+            seed_pending_remint_row(&mock, id, 0);
+            let deadline = base + chrono::Duration::seconds(3 - i);
+            state
+                .pending_remints
+                .push(matured_entry(id, id as u64, deadline));
+        }
+        let oldest_id = 102;
+
+        process_pending_remints_within(&mut state, &storage_tx, std::time::Duration::ZERO).await;
+
+        assert_eq!(state.pending_remints.len(), 3);
+        let handled: Vec<_> = state
+            .pending_remints
+            .iter()
+            .filter(|e| e.finality_check_attempts == 1)
+            .map(|e| e.ctx.transaction_id)
+            .collect();
+        assert_eq!(handled, vec![Some(oldest_id)]);
     }
 
     /// When the pending_remints queue contains both matured entries (deadline
@@ -1925,6 +2234,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         // Entry 2: immature — must not be touched at all.
@@ -1947,6 +2258,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -2048,6 +2361,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -2114,6 +2429,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
     }
 
@@ -2434,7 +2751,7 @@ mod tests {
             .unwrap();
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
-        // The defer path persists the bumped counter, so the row has to exist.
+        // A charged defer would persist the bumped counter, so the row has to exist.
         seed_pending_remint_row(&mock, 99, 0);
 
         queue_dead_remint(&mut state, 3);
@@ -2450,6 +2767,420 @@ mod tests {
             1,
             "the entry must wait for the indexer instead of refunding on an unproven absence"
         );
+    }
+
+    // ── free waits ───────────────────────────────────────────────────
+
+    /// The attempt counter persisted on the row, which only a charged deferral writes.
+    fn persisted_attempts(
+        mock: &MockStorage,
+        transaction_id: i64,
+    ) -> (i32, Option<chrono::DateTime<Utc>>) {
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+            .map(|t| (t.finality_check_attempts, t.pending_remint_deadline_at))
+            .expect("row present")
+    }
+
+    /// Mature the queued entry so the next tick evaluates it again.
+    fn mature(state: &mut SenderState) {
+        state.pending_remints[0].deadline = Utc::now() - chrono::Duration::seconds(1);
+    }
+
+    /// Answer `method` with `body(value)`, reading `value` per call so a test can move the chain.
+    fn mock_moving(
+        server: &mut mockito::ServerGuard,
+        method: &str,
+        value: Arc<std::sync::atomic::AtomicU64>,
+        body: fn(u64) -> String,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(format!(
+                r#""method"\s*:\s*"{method}""#
+            )))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| body(value.load(Ordering::SeqCst)).into_bytes())
+            .expect_at_least(0)
+            .create()
+    }
+
+    /// A dead release with a clear bitmap, so the record gate decides every tick.
+    async fn record_gate_server() -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+        let mut server = mockito::Server::new_async().await;
+        let mocks = vec![
+            mock_dead_signature(&mut server).await,
+            mock_bitmap_account(&mut server, 0, &[]),
+            mock_remint_blockhash(&mut server).await,
+        ];
+        (server, mocks)
+    }
+
+    /// A release refused at preflight never lands, so its signature stays Live until
+    /// its blockhash expires, the bitmap waits for finality to pass it, and the first
+    /// coverage read almost always trails the confirmed bound. All three wait for free.
+    #[tokio::test]
+    async fn a_refused_release_is_refunded_after_its_first_coverage_read_lags() {
+        use std::sync::atomic::AtomicU64;
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+
+        let lvbh = 1_000;
+        let height = Arc::new(AtomicU64::new(50));
+        let finalized_lvbh = Arc::new(AtomicU64::new(1_100));
+        let _status = mock_rpc(
+            &mut dest,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_moving(&mut dest, "getBlockHeight", height.clone(), |h| {
+            format!(r#"{{"jsonrpc":"2.0","result":{h},"id":0}}"#)
+        });
+        let _floor = mock_ledger_floor(&mut dest, 0).await;
+        let _finalized = mock_moving(
+            &mut dest,
+            "getLatestBlockhash",
+            finalized_lvbh.clone(),
+            |l| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{l}}}}},"id":0}}"#
+                )
+            },
+        );
+        let _bitmap = mock_bitmap_account(&mut dest, 0, &[]);
+        let (_slot, _calls) = mock_get_slot(&mut dest, 9_000);
+
+        let _remint_blockhash = mock_remint_blockhash(&mut source).await;
+        let _send = mock_send_echoing_signature(&mut source).await;
+        let _remint_status = mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].signatures = vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: lvbh,
+            blockhash_slot: Some(500),
+        }];
+
+        // Tick 1: block height below lvbh, so the signature is still Live.
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(storage_rx.try_recv().is_err());
+        assert_eq!(state.pending_remints[0].free_waits, 1);
+
+        // Tick 2: expired at confirmed, but the finalized tip is not past lvbh yet.
+        height.store(1_100, Ordering::SeqCst);
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(storage_rx.try_recv().is_err());
+        assert_eq!(state.pending_remints[0].free_waits, 2);
+        let persisted = persisted_attempts(&mock, 99);
+
+        // Tick 3: the bitmap is clear and the first coverage read trails the bound.
+        finalized_lvbh.store(1_200, Ordering::SeqCst);
+        mock.update_committed_checkpoint("escrow", 8_970)
+            .await
+            .unwrap();
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lagging first coverage read must not escalate"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
+        assert_eq!(
+            persisted_attempts(&mock, 99),
+            persisted,
+            "a free wait must not persist a counter bump"
+        );
+
+        // Tick 4: the checkpoint passed the bound, so the absence is proven.
+        mock.update_committed_checkpoint("escrow", 9_001)
+            .await
+            .unwrap();
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        let update = storage_rx
+            .try_recv()
+            .expect("the refund must resolve the row");
+        assert_eq!(update.status, TransactionStatus::FailedReminted);
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// Every check re-runs the signature and bitmap gates, so the attempts must still be
+    /// unspent after their expected waits. A failed read on the next check is then charged
+    /// once, not escalated, and the persisted counter a restart reloads is still zero.
+    #[tokio::test]
+    async fn a_transient_error_after_the_expected_waits_does_not_escalate() {
+        use std::sync::atomic::AtomicU64;
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+
+        let height = Arc::new(AtomicU64::new(50));
+        let finalized_lvbh = Arc::new(AtomicU64::new(1_100));
+        let _status = mock_rpc(
+            &mut dest,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        // A height of zero stands for an RPC outage.
+        let _height = mock_moving(&mut dest, "getBlockHeight", height.clone(), |h| match h {
+            0 => r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"down"},"id":0}"#.into(),
+            h => format!(r#"{{"jsonrpc":"2.0","result":{h},"id":0}}"#),
+        });
+        let _floor = mock_ledger_floor(&mut dest, 0).await;
+        let _finalized = mock_moving(
+            &mut dest,
+            "getLatestBlockhash",
+            finalized_lvbh.clone(),
+            |l| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{l}}}}},"id":0}}"#
+                )
+            },
+        );
+        let _bitmap = mock_bitmap_account(&mut dest, 0, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&dest.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].signatures = vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 1_000,
+            blockhash_slot: Some(500),
+        }];
+
+        // Tick 1 sees the signature Live, tick 2 sees the finalized tip short of lvbh.
+        process_pending_remints(&mut state, &storage_tx).await;
+        height.store(1_100, Ordering::SeqCst);
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(storage_rx.try_recv().is_err());
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
+        assert_eq!(persisted_attempts(&mock, 99).0, 0);
+
+        // Tick 3: the block height read fails.
+        height.store(0, Ordering::SeqCst);
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "one transient error after the expected waits must not escalate"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        assert_eq!(persisted_attempts(&mock, 99).0, 1);
+    }
+
+    /// A checkpoint that does not move is a stuck indexer, not one catching up. Only the
+    /// first read is free; later frozen reads are charged and escalate at the shared cap.
+    #[tokio::test]
+    async fn a_frozen_checkpoint_gets_one_free_wait_then_escalates() {
+        ensure_test_signer();
+        let (mut server, _mocks) = record_gate_server().await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.update_committed_checkpoint("escrow", 8_970)
+            .await
+            .unwrap();
+        seed_pending_remint_row(&mock, 99, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the first coverage read is free"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
+
+        for charged in 1..MAX_FINALITY_CHECK_ATTEMPTS {
+            mature(&mut state);
+            process_pending_remints(&mut state, &storage_tx).await;
+            assert!(storage_rx.try_recv().is_err(), "charge {charged} defers");
+            assert_eq!(state.pending_remints[0].finality_check_attempts, charged);
+        }
+
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        let update = storage_rx
+            .try_recv()
+            .expect("a checkpoint that did not move must be charged");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// Coverage that cannot be measured is not progress, so each of these is charged on the
+    /// very first read.
+    #[tokio::test]
+    async fn unreadable_coverage_inputs_are_charged() {
+        for case in ["checkpoint read error", "no checkpoint", "getSlot error"] {
+            ensure_test_signer();
+            let (mut server, _mocks) = record_gate_server().await;
+            let _slot = (case != "getSlot error").then(|| mock_get_slot(&mut server, 9_000));
+
+            let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+            state.instance_pda = Some(Pubkey::new_unique());
+            match case {
+                "checkpoint read error" => mock.set_should_fail("get_committed_checkpoint", true),
+                "getSlot error" => mock
+                    .update_committed_checkpoint("escrow", 8_970)
+                    .await
+                    .unwrap(),
+                _ => {}
+            }
+            seed_pending_remint_row(&mock, 99, 0);
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+            queue_dead_remint(&mut state, 3);
+            process_pending_remints(&mut state, &storage_tx).await;
+
+            assert!(storage_rx.try_recv().is_err(), "{case}");
+            assert_eq!(state.pending_remints.len(), 1, "{case}");
+            assert_eq!(
+                state.pending_remints[0].finality_check_attempts, 1,
+                "{case}"
+            );
+            assert_eq!(persisted_attempts(&mock, 99).0, 1, "{case}");
+        }
+    }
+
+    /// An indexer that keeps moving but never reaches the bound (a bound read from a node
+    /// far ahead, or a crawling indexer) must still end in ManualReview: free waits run
+    /// out after `MAX_FREE_WAITS`, and later reads are charged up to the shared cap.
+    #[tokio::test]
+    async fn free_waits_are_capped() {
+        ensure_test_signer();
+        let (mut server, _mocks) = record_gate_server().await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+
+        let mut checkpoint = 8_000;
+        for wait in 1..=MAX_FREE_WAITS {
+            checkpoint += 1;
+            mock.update_committed_checkpoint("escrow", checkpoint)
+                .await
+                .unwrap();
+            mature(&mut state);
+            process_pending_remints(&mut state, &storage_tx).await;
+            assert!(storage_rx.try_recv().is_err(), "wait {wait} must be free");
+            assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
+            assert_eq!(state.pending_remints[0].free_waits, wait);
+        }
+
+        for charged in 1..=MAX_FINALITY_CHECK_ATTEMPTS {
+            checkpoint += 1;
+            mock.update_committed_checkpoint("escrow", checkpoint)
+                .await
+                .unwrap();
+            mature(&mut state);
+            process_pending_remints(&mut state, &storage_tx).await;
+            if charged < MAX_FINALITY_CHECK_ATTEMPTS {
+                assert!(storage_rx.try_recv().is_err(), "charge {charged} defers");
+                assert_eq!(state.pending_remints[0].finality_check_attempts, charged);
+            }
+        }
+        let update = storage_rx
+            .try_recv()
+            .expect("past the cap an expected wait is charged");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// A free wait only defers a refund; a release on record still blocks it at once.
+    #[tokio::test]
+    async fn a_recorded_release_still_wins_while_the_checkpoint_advances() {
+        ensure_test_signer();
+        let (mut server, _mocks) = record_gate_server().await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.update_committed_checkpoint("escrow", 8_970)
+            .await
+            .unwrap();
+        seed_observed_release(&mock, 3, &Signature::new_unique().to_string()).await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].coverage_checkpoint = Some(8_900);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a recorded release must escalate");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(journaled_attempts(&mock, 99), 0);
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// The free-wait state is in memory only. An entry restored after a restart with
+    /// two charged attempts gets a fresh first coverage read, which must be free.
+    #[tokio::test]
+    async fn a_recovered_entry_gets_a_free_first_coverage_read() {
+        ensure_test_signer();
+        let (mut server, _mocks) = record_gate_server().await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.update_committed_checkpoint("escrow", 8_970)
+            .await
+            .unwrap();
+        seed_pending_remint_row(&mock, 99, 2);
+        {
+            let mut rows = mock.pending_remint_transactions.lock().unwrap();
+            let row = &mut rows[0];
+            row.withdrawal_nonce = Some(3);
+            row.remint_signatures = Some(vec![Signature::new_unique().to_string()]);
+            row.remint_last_valid_block_heights = Some(vec![0]);
+            row.pending_remint_deadline_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
+
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the first coverage read after a restart is free"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
+        assert_eq!(persisted_attempts(&mock, 99).0, 2);
     }
 
     /// Once the checkpoint reaches the bound, the absence is real evidence and
@@ -2721,12 +3452,11 @@ mod tests {
         );
 
         // The journaled attempt finalized successfully on the source chain.
-        let _status = mock_rpc(
+        let _status = mock_status_snapshot(
             &mut rpc_server,
-            "getSignatureStatuses",
-            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
-                "slot":100,"confirmations":null,"err":null,
-                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+            r#"{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+            200,
+            0,
         )
         .await;
         // A second broadcast here is the double credit this gate exists to stop.
@@ -2885,6 +3615,64 @@ mod tests {
         );
     }
 
+    /// A journaled attempt the snapshot proves dead is retired by the claim, and only then is a new MintTo sent.
+    #[tokio::test]
+    async fn execute_deferred_remint_retires_a_dead_attempt_and_resends() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        state.confirmation_poll_interval_ms = 1;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let prior = Signature::new_unique();
+        mock.remint_signatures.lock().unwrap().insert(
+            716,
+            vec![StoredSig {
+                signature: prior.to_string(),
+                last_valid_block_height: 100,
+                blockhash_slot: Some(50),
+            }],
+        );
+        // Absent, expired (height 200 past lvbh 100) and retained (floor 10 below slot 50): Dead.
+        let _snapshot = mock_status_snapshot(&mut rpc_server, "null", 200, 10).await;
+        let _blockhash = mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let send = mock_send_echoing_signature(&mut rpc_server).await.expect(1);
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+
+        seed_pending_remint_row(&mock, 716, 0);
+
+        let entry = make_matured_remint(716, 77);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        // Unless the claim retires the dead attempt it reports the slot held elsewhere and nothing is sent.
+        send.assert_async().await;
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::Resolved),
+            "the fresh remint finalized, so the entry resolves"
+        );
+        let update = storage_rx
+            .try_recv()
+            .expect("the fresh remint must resolve the row");
+        assert_eq!(update.status, TransactionStatus::FailedReminted);
+        assert_ne!(
+            update.remint_signature.as_deref(),
+            Some(prior.to_string().as_str()),
+            "the recorded remint is the new MintTo, not the dead attempt"
+        );
+    }
+
     /// The signature has to reach the journal before it reaches the network, or
     /// a crash in the send window leaves nothing for the next pass to classify.
     #[tokio::test]
@@ -3032,11 +3820,13 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         }
     }
 
     /// Fail-closed: a journaled attempt that cannot be classified (here the
-    /// backend rejects getSignatureStatuses) might have landed, so attempt_remint
+    /// backend has no status snapshot) might have landed, so attempt_remint
     /// must refuse to mint and escalate rather than risk a duplicate remint.
     #[tokio::test]
     async fn execute_deferred_remint_fails_closed_when_a_journaled_attempt_is_unclassifiable() {
@@ -3053,10 +3843,10 @@ mod tests {
                 blockhash_slot: None,
             }],
         );
-        // The status lookup that would classify it is unavailable on this backend.
+        // The snapshot that would classify it is unavailable on this backend.
         let _statuses = mock_rpc(
             &mut rpc_server,
-            "getSignatureStatuses",
+            "getSignatureStatusSnapshot",
             r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
         )
         .await;
@@ -3080,6 +3870,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         };
 
         let _outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
@@ -3160,6 +3952,8 @@ mod tests {
             finality_check_attempts: MAX_FINALITY_CHECK_ATTEMPTS - 1,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3241,6 +4035,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3316,6 +4112,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3396,6 +4194,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3719,7 +4519,8 @@ mod tests {
     #[tokio::test]
     async fn channel_absence_without_a_journaled_slot_is_uncertain() {
         let mut server = mockito::Server::new_async().await;
-        mock_dead(&mut server).await;
+        // Expired absence with a floor covering everything: only the missing slot blocks Dead.
+        let _snapshot = mock_status_snapshot(&mut server, "null", 1000, 0).await;
 
         let rpc = make_rpc(&server.url());
         let sigs = vec![PendingSig {
@@ -3727,13 +4528,13 @@ mod tests {
             last_valid_block_height: 100,
             blockhash_slot: None,
         }];
-        assert!(
-            matches!(
-                classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await,
-                SigFinality::Uncertain(_)
+        match classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await {
+            SigFinality::Uncertain(reason) => assert!(
+                reason.contains("predates the journaled blockhash slot"),
+                "uncertain for the wrong reason: {reason}"
             ),
-            "a tunable window with no journaled slot must not resolve to Dead"
-        );
+            _ => panic!("a tunable window with no journaled slot must not resolve to Dead"),
+        }
     }
 
     // ── liveness gate paths ────────────────────────────────────────────
@@ -3789,6 +4590,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3857,6 +4660,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3867,9 +4672,10 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(
-            state.pending_remints[0].finality_check_attempts, 1,
-            "counter must be bumped after a liveness deferral"
+            state.pending_remints[0].finality_check_attempts, 0,
+            "a liveness deferral is an expected wait and must not spend an attempt"
         );
+        assert_eq!(state.pending_remints[0].free_waits, 1);
     }
 
     /// Entry already at the deferral cap on the liveness branch must escalate
@@ -3917,6 +4723,9 @@ mod tests {
             finality_check_attempts: 2, // one more attempt hits the cap
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            // Free waits spent, so liveness is charged again.
+            free_waits: MAX_FREE_WAITS,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3981,6 +4790,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4057,6 +4868,8 @@ mod tests {
             finality_check_attempts: 0,
             release_refused_on_chain: false,
             coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4066,13 +4879,110 @@ mod tests {
             "no status update: a confirmed-but-not-finalized sig must defer the remint"
         );
         assert_eq!(state.pending_remints.len(), 1);
-        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        assert_eq!(state.pending_remints[0].free_waits, 1);
     }
 
-    /// One endpoint is not one snapshot: the channel read node serves a replica that can
-    /// lag and catch up between two calls. A status read on the lagging state paired with
-    /// a height read on the caught-up one proves a landed mint dead, and the deposit is
-    /// minted twice. Reading height first means status never comes from an older state.
+    /// Register a `getSignatureStatusSnapshot` reply: `status` is one JSON status or `null`.
+    async fn mock_status_snapshot(
+        server: &mut mockito::Server,
+        status: &str,
+        height: u64,
+        floor: u64,
+    ) -> mockito::Mock {
+        mock_rpc(
+            server,
+            "getSignatureStatusSnapshot",
+            &format!(
+                r#"{{"jsonrpc":"2.0","result":{{"blockHeight":{height},"firstAvailableBlock":{floor},"value":[{status}]}},"id":1}}"#
+            ),
+        )
+        .await
+    }
+
+    /// The separate reads that used to prove a landed mint dead; a channel proof must not hit them.
+    async fn mock_unused_separate_reads(server: &mut mockito::Server) -> Vec<mockito::Mock> {
+        let null_status = mock_rpc(
+            server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1300},"value":[null]},"id":1}"#,
+        )
+        .await
+        .expect(0);
+        let height = mock_rpc(
+            server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1300,"id":1}"#,
+        )
+        .await
+        .expect(0);
+        let floor = mock_ledger_floor(server, 400).await.expect(0);
+        vec![null_status, height, floor]
+    }
+
+    fn channel_attempt() -> Vec<PendingSig> {
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 1150,
+            blockhash_slot: Some(1000),
+        }]
+    }
+
+    /// A channel proof reads only the snapshot, so a stale null from a separate call is never used.
+    #[tokio::test]
+    async fn channel_classification_reads_one_snapshot_not_three_calls() {
+        let mut server = mockito::Server::new_async().await;
+        let sigs = channel_attempt();
+        let snapshot = mock_status_snapshot(
+            &mut server,
+            r#"{"slot":1010,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+            1300,
+            400,
+        )
+        .await;
+        let separate = mock_unused_separate_reads(&mut server).await;
+        let rpc = make_rpc(&server.url());
+
+        match classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await {
+            SigFinality::Landed(signature) => assert_eq!(signature, sigs[0].signature),
+            SigFinality::Dead => panic!("a landed mint was proven dead and would be re-minted"),
+            SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
+                panic!("expected Landed, got an unresolved verdict: {reason}")
+            }
+        }
+        snapshot.assert_async().await;
+        for mock in separate {
+            mock.assert_async().await;
+        }
+    }
+
+    /// A core without the snapshot answers -32601, which must stay Uncertain with no fallback.
+    #[tokio::test]
+    async fn channel_snapshot_unavailable_is_uncertain_without_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let sigs = channel_attempt();
+        let snapshot = mock_rpc(
+            &mut server,
+            "getSignatureStatusSnapshot",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#,
+        )
+        .await;
+        let separate = mock_unused_separate_reads(&mut server).await;
+        let rpc = make_rpc(&server.url());
+
+        match classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await {
+            SigFinality::Uncertain(_) => {}
+            SigFinality::Dead => panic!("an unanswered snapshot was turned into a Dead proof"),
+            SigFinality::Landed(_) | SigFinality::Live(_) => {
+                panic!("expected Uncertain for an unanswered snapshot")
+            }
+        }
+        snapshot.assert_async().await;
+        for mock in separate {
+            mock.assert_async().await;
+        }
+    }
+
+    /// Solana still reads separately: height first, so a null never comes from an older state.
     #[tokio::test]
     async fn classify_replica_catching_up_between_calls_is_not_dead() {
         let last_valid_block_height = 1150;
@@ -4081,8 +4991,8 @@ mod tests {
         let caught_up_height = 1300;
         let landed_sig = Signature::new_unique();
 
-        // The first request of any method sees the lagging replica; every later one sees
-        // it caught up, with the mint finalized.
+        // The first request of any method sees the lagging endpoint; every later one sees
+        // it caught up, with the transaction finalized.
         let requests_seen = Arc::new(AtomicUsize::new(0));
         let mut server = mockito::Server::new_async().await;
         let status_requests = requests_seen.clone();
@@ -4145,9 +5055,9 @@ mod tests {
             blockhash_slot: Some(blockhash_slot),
         }];
 
-        match classify_signatures(&FinalityRpc::channel(&client, None), &sigs).await {
+        match classify_signatures(&FinalityRpc::solana(&client, None), &sigs).await {
             SigFinality::Landed(signature) => assert_eq!(signature, landed_sig),
-            SigFinality::Dead => panic!("a landed mint was proven dead and would be re-minted"),
+            SigFinality::Dead => panic!("a landed transaction was proven dead"),
             SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
                 panic!("expected Landed, got an unresolved verdict: {reason}")
             }

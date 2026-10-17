@@ -1,8 +1,12 @@
 use {
     crate::{
         accounts::{
-            address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
-            redis::RedisAccountsDB, writer_epoch, writer_lease::WriterLease, AccountsDB,
+            address_index_repair::repair_address_signatures,
+            postgres::{ensure_address_signatures_signature_index, PostgresAccountsDB},
+            redis::RedisAccountsDB,
+            writer_epoch,
+            writer_lease::WriterLease,
+            AccountsDB,
         },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
@@ -272,6 +276,13 @@ async fn read_accounts_db(
     Ok(AccountsDB::Redis(redis))
 }
 
+/// Largest accepted `max_connections`. It only guards typos: far above any real file
+/// descriptor limit, and well below the semaphore's own permit ceiling.
+pub const MAX_RPC_CONNECTIONS: usize = 10_000_000;
+
+/// Largest accepted `perf_sample_period_secs`: the settle stage stores it as a u16.
+pub const MAX_PERF_SAMPLE_PERIOD_SECS: u64 = u16::MAX as u64;
+
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
     if config.blocktime_ms == 0 {
@@ -285,19 +296,70 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 .into(),
         );
     }
-    // Zero capacity would panic the bounded-channel constructors below; fail closed instead.
+    // Every mode serves RPC through this cap. Zero binds the port but admits no connection.
+    if config.max_connections == 0 {
+        return Err(
+            "max_connections (PRIVATE_CHANNEL_MAX_CONNECTIONS) must be greater than 0".into(),
+        );
+    }
+    if config.max_connections > MAX_RPC_CONNECTIONS {
+        return Err(format!(
+            "max_connections (PRIVATE_CHANNEL_MAX_CONNECTIONS) must be at most {MAX_RPC_CONNECTIONS}"
+        )
+        .into());
+    }
+    // Zero capacity would panic the bounded-channel constructors below, and zero workers or
+    // sampling period would stop the pipeline; fail closed instead.
     if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-        for (name, cap) in [
-            ("ingress_queue_capacity", config.ingress_queue_capacity),
-            ("sequencer_queue_capacity", config.sequencer_queue_capacity),
+        for (name, env, cap) in [
+            (
+                "ingress_queue_capacity",
+                "PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY",
+                config.ingress_queue_capacity,
+            ),
+            (
+                "sequencer_queue_capacity",
+                "PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY",
+                config.sequencer_queue_capacity,
+            ),
             (
                 "execution_results_capacity",
+                "PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY",
                 config.execution_results_capacity,
+            ),
+            (
+                "sigverify_queue_size",
+                "PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE",
+                config.sigverify_queue_size,
+            ),
+            (
+                "sigverify_workers",
+                "PRIVATE_CHANNEL_SIGVERIFY_WORKERS",
+                config.sigverify_workers,
+            ),
+            (
+                "batch_channel_capacity",
+                "PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY",
+                config.batch_channel_capacity,
             ),
         ] {
             if cap == 0 {
-                return Err(format!("{name} must be greater than 0").into());
+                return Err(format!("{name} ({env}) must be greater than 0").into());
             }
+        }
+        if config.perf_sample_period_secs == 0 {
+            return Err(
+                "perf_sample_period_secs (PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS) must be \
+                 greater than 0"
+                    .into(),
+            );
+        }
+        if config.perf_sample_period_secs > MAX_PERF_SAMPLE_PERIOD_SECS {
+            return Err(format!(
+                "perf_sample_period_secs (PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS) must be at \
+                 most {MAX_PERF_SAMPLE_PERIOD_SECS}"
+            )
+            .into());
         }
     }
 
@@ -418,12 +480,14 @@ async fn start_services(
         };
         let writer_epoch = writer_epoch::bump(postgres_db).await?;
         info!("Claimed writer epoch {writer_epoch}");
+        // Before any address_signatures writer starts, so a first build blocks nothing live.
+        ensure_address_signatures_signature_index(&postgres_db.pool).await?;
         repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
         let (initial_live_blockhashes, initial_dedup_cache) =
             load_dedup_state(&db, config.max_blockhashes).await?;
         // Seeded before RPC starts so isBlockhashValid never reports slot 0 on a live chain.
         let settled_slot = Arc::new(AtomicU64::new(db.get_current_slot().await?.unwrap_or(0)));
-        // Both counters start at zero: the window loaded above is already in dedup.
+        // All counters start at zero: the window loaded above is already in dedup.
         let blockhash_progress = Arc::new(crate::stages::BlockhashProgress::default());
 
         let dedup_hb = crate::health::StageHeartbeat::new();
@@ -490,6 +554,7 @@ async fn start_services(
             max_svm_workers: config.max_svm_workers,
             heartbeat: executor_hb,
             live_blockhashes: Arc::clone(&live_blockhashes),
+            blockhash_progress: Arc::clone(&blockhash_progress),
         })
         .await;
         workers.push(execution);
@@ -527,6 +592,8 @@ async fn start_services(
             writer_epoch: Some(writer_epoch),
             settled_slot: Arc::clone(&settled_slot),
             blockhash_progress: Arc::clone(&blockhash_progress),
+            live_blockhashes: Arc::clone(&live_blockhashes),
+            max_blockhashes: config.max_blockhashes,
             cache_aligned,
         })
         .await;
@@ -574,6 +641,12 @@ async fn start_services(
                 max_blockhashes,
                 simulation_permits: tokio::sync::Semaphore::new(
                     crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
+                ),
+                // Sized by the same resolver as the pool, so the cap always matches it.
+                block_list_permits: tokio::sync::Semaphore::new(
+                    crate::rpc::constants::block_list_slots(
+                        crate::accounts::postgres::resolve_pool_size(),
+                    ),
                 ),
             })
         }
@@ -1112,7 +1185,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.err().unwrap().to_string(),
-            "sequencer_queue_capacity must be greater than 0"
+            "sequencer_queue_capacity (PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY) must be greater than 0"
         );
     }
 }

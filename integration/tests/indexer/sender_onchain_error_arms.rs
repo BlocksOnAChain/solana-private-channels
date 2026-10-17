@@ -41,7 +41,7 @@ use {
             SignerUtil,
         },
         storage::{
-            common::{models::DbMint, storage::mock::MockStorage},
+            common::{amount::TokenAmount, models::DbMint, storage::mock::MockStorage},
             Storage, TransactionStatus,
         },
     },
@@ -263,11 +263,11 @@ async fn retry_under_idempotent_policy_recursively_resends_and_completes() {
 // variants and asserts the resulting `TransactionStatusUpdate` shape.
 // ============================================================================
 
-/// Build a `SenderState` with optional pre-seeded mint cache + builder for
+/// Build a `SenderState` with an optional seeded mint row + builder for
 /// the JIT-driven caller-arm tests. The default `build_default_sender_state`
 /// fixture doesn't seed anything; these tests need both knobs.
 async fn build_state_for_jit_caller_arm(
-    populate_mint_cache: bool,
+    seed_mint_row: bool,
 ) -> (
     private_channel_indexer::operator::sender::types::SenderState,
     tokio::sync::mpsc::Receiver<TransactionStatusUpdate>,
@@ -279,10 +279,15 @@ async fn build_state_for_jit_caller_arm(
     let mock = MockRpcServer::start().await;
     let mock_storage = MockStorage::new();
     let mint = Pubkey::new_unique();
-    if populate_mint_cache {
+    if seed_mint_row {
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
-            DbMint::new(mint.to_string(), 6, spl_token::id().to_string()),
+            DbMint::new(
+                mint.to_string(),
+                6,
+                spl_token::id().to_string(),
+                TokenAmount(1),
+            ),
         );
     }
     let storage = Arc::new(Storage::Mock(mock_storage));
@@ -351,8 +356,8 @@ fn make_mint_builder_for_caller_arm(mint: Pubkey) -> MintToBuilder {
 
 /// Drive the caller arm with `Ok(MintNotInitialized)` after seeding the
 /// mint_builders entry. Pulled out so each test reads as a wire-script plus
-/// assertions block. `claim_lease` is the ownership lease the JIT re-fire
-/// presents; only the Retry outcome needs one.
+/// assertions block. `claim_lease` is the ownership lease the JIT re-fire and
+/// the Transient requeue present; ManualReview outcomes run without one.
 async fn drive_caller_arm_with_jit_setup(
     state: &mut private_channel_indexer::operator::sender::types::SenderState,
     txn_id: i64,
@@ -513,23 +518,24 @@ async fn mint_not_initialized_jit_manual_review_corrupt_state() {
 /// private channel mint until someone edited the database by hand.
 #[tokio::test]
 async fn mint_not_initialized_jit_transient_requeues_deposit() {
-    // Mint cache empty, so the JIT body returns Transient("mint not in mint cache").
+    // No mint row, so the JIT body returns Transient("mint decimals unavailable").
     let (mut state, mut storage_rx, storage_tx, mock, mint) =
         build_state_for_jit_caller_arm(false).await;
 
     // Pre-check sees uninit (would normally fall through to init) but
-    // get_mint_metadata fails because the cache is empty.
+    // get_mint_decimals fails because there is no mint row.
     mock.enqueue(
         "getAccountInfo",
         account_info_reply_bytes(&[0u8; Mint::LEN]),
     );
 
     let txn_id: i64 = 5004;
+    let claim_lease = chrono::Utc::now();
     if let Storage::Mock(mock_storage) = &*state.storage {
-        seed_processing_deposit(mock_storage, txn_id, chrono::Utc::now(), 0);
+        seed_processing_deposit(mock_storage, txn_id, claim_lease, 0);
     }
 
-    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, None, &storage_tx).await;
+    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, Some(claim_lease), &storage_tx).await;
 
     assert!(
         storage_rx.try_recv().is_err(),
@@ -571,11 +577,12 @@ async fn mint_not_initialized_jit_transient_at_cap_leaves_processing() {
     // The cap constant is crate-private to the indexer, so this mirrors its
     // value rather than importing it.
     let txn_id: i64 = 5005;
+    let claim_lease = chrono::Utc::now();
     if let Storage::Mock(mock_storage) = &*state.storage {
-        seed_processing_deposit(mock_storage, txn_id, chrono::Utc::now(), 3);
+        seed_processing_deposit(mock_storage, txn_id, claim_lease, 3);
     }
 
-    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, None, &storage_tx).await;
+    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, Some(claim_lease), &storage_tx).await;
 
     assert!(
         storage_rx.try_recv().is_err(),

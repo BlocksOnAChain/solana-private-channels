@@ -1,5 +1,9 @@
 use {
-    crate::rpc::get_signatures_for_address_impl::SignaturesForAddressConfig,
+    crate::rpc::{
+        get_address_index_slot_impl::AddressIndexSlot,
+        get_signature_status_snapshot_impl::RpcStatusSnapshot,
+        get_signatures_for_address_impl::SignaturesForAddressConfig,
+    },
     jsonrpsee::{core::RpcResult, proc_macros::rpc},
     serde_json::Value,
     solana_account_decoder_client_types::{token::UiTokenAmount, UiAccount},
@@ -93,6 +97,13 @@ pub trait PrivateChannelRpc {
         config: Option<RpcSignatureStatusConfig>,
     ) -> RpcResult<Response<Vec<Option<TransactionStatus>>>>;
 
+    /// Statuses, block height and ledger floor from one snapshot, for proving an absence
+    #[method(name = "getSignatureStatusSnapshot")]
+    async fn get_signature_status_snapshot(
+        &self,
+        signatures: Vec<String>,
+    ) -> RpcResult<RpcStatusSnapshot>;
+
     /// Get the current transaction count
     #[method(name = "getTransactionCount")]
     async fn get_transaction_count(&self, config: Option<RpcContextConfig>) -> RpcResult<u64>;
@@ -100,6 +111,11 @@ pub trait PrivateChannelRpc {
     /// Get the first available block in the ledger
     #[method(name = "getFirstAvailableBlock")]
     async fn get_first_available_block(&self) -> RpcResult<u64>;
+
+    /// Get how far the address index is complete, against the newest block.
+    /// Not Solana RPC: resync gates on it, and the gateway keeps it operator-only.
+    #[method(name = "getAddressIndexSlot")]
+    async fn get_address_index_slot(&self) -> RpcResult<AddressIndexSlot>;
 
     /// Get a list of confirmed blocks between two slots
     #[method(name = "getBlocks")]

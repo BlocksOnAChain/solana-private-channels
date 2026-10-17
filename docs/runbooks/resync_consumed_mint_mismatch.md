@@ -19,13 +19,14 @@ field that disagrees as `field: channel X, row Y`, one of:
 - `mint`, `recipient ATA` or `amount` - the channel `MintTo` does not pay what
   the source event says.
 
-A sibling refusal fires when one source event has two successful authority-signed
-mints, a double issuance even if both pay the right amount:
+A sibling refusal fires when one source event has two successful channel mints,
+a double issuance even if both pay the right amount. After an admin rotation the
+two can be signed by different keys, one of them rotated out:
 
 ```
 consumed-set unavailable, resync aborted before drop: source event <id> has two
-successful channel mints signed by the authority, <sig_a> and <sig_b>; one
-event may be minted once, see docs/runbooks/resync_consumed_mint_mismatch.md
+successful channel mints, <sig_a> and <sig_b>; one event may be minted once, see
+docs/runbooks/resync_consumed_mint_mismatch.md
 ```
 
 Handle it the same way, inspecting both signatures.
@@ -36,12 +37,17 @@ deletes anything. The database is exactly as it was.
 
 ## What it means
 
-Only the operator's mint authority can produce these channel transactions:
-resync ignores any the authority did not sign. So a mismatch means one of:
+Only a key holding a receipt mint's mint authority can produce these channel
+transactions. Resync reads two histories: the current authority's, where it
+ignores any transaction the authority did not sign, and each rebuilt row's
+receipt mint, where it counts only a successful `MintTo` on that mint. The
+second one also lists mints by any key that held the mint authority before an
+admin rotation. So a mismatch means one of:
 
 - An operator bug issued a mint with the wrong mint, recipient or amount, or
   labelled it with the wrong marker.
-- The mint authority key signed a transaction the operator did not build.
+- A current or rotated-out mint authority key signed a transaction the operator
+  did not build.
 
 Either way the channel issuance for this event cannot be trusted, and rerunning
 the resync will fail the same way.
@@ -83,8 +89,8 @@ take every row of that source transaction out of reach:
     WHERE transaction_id IN (SELECT id FROM transactions WHERE signature = :source_signature);
    ```
 2. Quarantine every state the operators resume on their own. The sender
-   restores `pending_remint` rows on startup and recovery requeues `parked`
-   ones.
+   loads `pending_remint` rows a page at a time after a restart and recovery
+   requeues `parked` ones.
    ```sql
    UPDATE transactions SET status = 'manual_review', updated_at = NOW()
     WHERE signature = :source_signature
@@ -101,9 +107,26 @@ Resync stays blocked until engineering resolves the contradiction.
 
 ## Related refusals: incomplete channel history
 
-Two more `ConsumedSetUnavailable` refusals mean the channel history the
-consumed-set was built from cannot be shown complete. Both fire before the
+Three more `ConsumedSetUnavailable` refusals mean the channel history the
+consumed-set was built from cannot be shown complete. All fire before the
 wipe, so the database is untouched.
+
+**The channel address index trails its newest block:**
+
+```
+consumed-set unavailable, resync aborted before drop: channel address index is at
+slot <watermark>, behind block <target>, the newest when resync started waiting,
+so its history may miss serviced mints
+```
+
+or `channel address index progress unreadable: ...`. The channel writes its
+address index after each block commits, and resync waits up to 30s for it to
+cover the block that was newest at its first read before reading any history. A refusal means it did not:
+the write node is down or its index writer is stuck, or the channel RPC is a
+node that does not serve `getAddressIndexSlot` (an older core). Check that the
+write node is running (it rebuilds missing index rows at startup), that
+`--channel-rpc-url` points at a node running a core with this method, then
+rerun.
 
 **A serviced row is missing from the channel history:**
 
@@ -114,12 +137,14 @@ lag, rerun once it catches up
 ```
 
 Every `completed` deposit (escrow resync) or `failed_reminted` withdrawal
-(withdraw resync) must appear in the authority's channel history. A missing one
+(withdraw resync) must appear in the channel history: the current authority's
+or its receipt mint's. A missing one
 would be rebuilt `pending` and paid again. The usual cause is lag: the channel
 writes its address index after each block commits, and a read replica can trail
 the primary. Wait, then rerun. If it keeps refusing, check that the write node has
-been up since its last crash (it rebuilds missing index rows at startup) and that
-the configured authority is the one that minted the named row.
+been up since its last crash (it rebuilds missing index rows at startup) and check
+the receipt mint's history for the named row's mint
+(`getSignaturesForAddress <row mint>` on the channel).
 
 **The channel history was pruned:**
 
@@ -135,29 +160,33 @@ already paid. Resync is not supported on a truncated channel. Escalate
 
 ### Resyncing an empty database
 
-With no rows, the missing-row check has nothing to compare, and the pruning check
-does not cover lag. Before resyncing an empty database, or rerunning a resync that
-was interrupted after its wipe, confirm all three:
+With no rows, the missing-row check has nothing to compare. The address index
+check above covers lag on the node resync reads, but it cannot see a different
+node, and a lagging read replica looks complete against itself. So before
+resyncing an empty database, or rerunning a resync that was interrupted after
+its wipe:
 
-1. The write node has been up since its last crash, so its startup index repair
-   has run.
-2. The read replica has replayed up to the primary: `pg_last_wal_replay_lsn()` on
-   the replica is at or past `pg_current_wal_lsn()` read on the primary just before.
-3. On the primary, the `address_signatures_flushed_slot` metadata value is at or
-   above the slot of the newest block that holds transactions.
+1. Point `--channel-rpc-url` at the same single read node the operators confirm
+   mints through: not a load balancer, and not a freshly restored replica.
+2. Confirm that read node's database has replayed up to the primary:
+   `pg_last_wal_replay_lsn()` on the replica is at or past `pg_current_wal_lsn()`
+   read on the primary just before. This covers mints the operators never saw
+   confirmed, which step 1 does not.
+3. Keep the write node running, or the index check may refuse until it restarts.
 
-Waiting a fixed time is not a substitute: a crashed write node leaves index rows
-missing until it restarts, and replica lag has no bound.
+Waiting a fixed time is not a substitute: replica lag has no bound.
 
 ### Failed deposits
 
 The missing-row check covers `completed` deposits only. A `failed` deposit keeps
 no mint signature (its broadcast journal is deleted once the row is terminal),
 so resync cannot tell a mint that never landed from one that landed after the
-confirmation timed out. If the channel index lags, a landed one is rebuilt
-`pending` and minted again. Before any escrow resync, triage every `failed`
-deposit with [`deposit_failed.md`](deposit_failed.md): a `LANDED` verdict makes
-the row `completed`, and the missing-row check then covers it.
+confirmation timed out. The address index check stops index lag on the node
+resync reads from hiding a mint that already landed, but a mint signed before
+the operators stopped can still land after resync reads the history, until its
+blockhash expires. Before any escrow resync, triage every `failed` deposit with
+[`deposit_failed.md`](deposit_failed.md): a `LANDED` verdict makes the row
+`completed`, and the missing-row check then covers it.
 
 ### Release gate
 
@@ -168,3 +197,7 @@ complete and could re-mint pruned deposits. So:
 - deploy core with this behaviour only after every indexer runs a version with
   both checks;
 - never roll the indexer back below that version while core has it.
+
+The address index check needs `getAddressIndexSlot`, so deploy core (write and
+read nodes) and the gateway before the indexer. A new indexer against an older
+core refuses every resync until core is upgraded.

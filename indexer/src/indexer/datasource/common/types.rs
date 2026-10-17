@@ -12,6 +12,9 @@ pub struct InstructionWithMetadata {
     pub slot: u64,
     pub program_type: ProgramType,
     pub signature: Option<String>,
+    /// Position of the transaction in its block, counting every transaction (failed and
+    /// unrelated ones too). Orders same-slot mint status changes.
+    pub transaction_index: u32,
     /// Absolute position of this instruction within its transaction's instruction
     /// list. Paired with `signature` it forms the durable per-instruction identity,
     /// so multiple economic events sharing one signature stay distinct.
@@ -29,6 +32,21 @@ pub struct CompiledInstruction {
     pub program_id_index: u8,
     pub accounts: Vec<u8>,
     pub data: String, // base58 encoded
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct InnerInstructions {
+    pub index: u8,
+    pub instructions: Vec<InnerInstruction>,
+}
+
+/// A single inner (CPI) instruction; `stack_height` is its CPI depth, used to match a deposit to the event it emitted.
+#[derive(Debug, Deserialize, Clone)]
+pub struct InnerInstruction {
+    #[serde(flatten)]
+    pub instruction: CompiledInstruction,
+    #[serde(rename = "stackHeight")]
+    pub stack_height: Option<u32>,
 }
 
 /// Where an instruction sits in its transaction, used to find the self-CPI

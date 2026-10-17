@@ -2,13 +2,13 @@ name: Rust Checks
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
   pull_request:
     branches:
       [
         main,
         hardening/pre-release-audit,
-        hardening/apex-scan-2,
+        hardening/cantina-reaudit,
         cantina-audit,
         ottersec-audit,
         feature/smt-to-bitmap-migration,
@@ -243,6 +243,13 @@ jobs:
 
       - name: Generate clients
         run: make generate-clients
+
+      # The shipped build and RPC alone (Yellowstone pulls in RPC). Runs before the
+      # workspace check, which is not --locked and could rewrite a stale Cargo.lock first.
+      - name: Check indexer feature profiles
+        run: |
+          cargo check -p private-channel-indexer --locked --all-targets
+          cargo check -p private-channel-indexer --locked --all-targets --no-default-features --features datasource-rpc
 
       - name: Run cargo check
         run: |
@@ -549,8 +556,11 @@ jobs:
         with:
           name: ci-build-artifacts
 
+      # `-m` stamps extraction time. The client sits outside this project's
+      # root, so rust-cache keeps its rlib; archived mtimes can predate it and
+      # cargo would link the stale client instead of rebuilding.
       - name: Restore shared artifacts
-        run: tar -xzf ci-build-artifacts.tgz
+        run: tar -xzmf ci-build-artifacts.tgz
 
       - name: Run fuzz harnesses
         run: make -C private-channel-escrow-program fuzz

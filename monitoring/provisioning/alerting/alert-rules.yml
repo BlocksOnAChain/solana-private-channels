@@ -263,7 +263,8 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"} / 1e9
+              # Withdraw operator under its prod (Ansible) and dev/devnet compose job names.
+              expr: private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -297,7 +298,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -312,6 +313,46 @@ groups:
                 - evaluator:
                     type: lt
                     params: [0.5]
+              refId: C
+
+      # The floors above fire only once the wallet is nearly empty. This fires on
+      # the speed of the drop, so a zero-fee or underpriced mint looping failed
+      # releases or dust withdrawals pages while there is still SOL left. It
+      # measures the drop from the hour's highest balance, so a top-up never
+      # fires it. A release costs about 10,000 lamports, so 0.05 SOL an hour is
+      # roughly 5,000 releases; raise it above the deployment's normal volume.
+      - uid: feepayer-burn-rate
+        title: "Feepayer SOL dropped more than 0.05 in the last hour"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Feepayer {{ $labels.job }} ({{ $labels.program_type }}) spent {{ $values.A }} SOL in the last hour. Find the mint with the triage query in private-channel-deploy/README.md, then block its withdrawals or reprice it"
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (max_over_time(private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"}[1h]) - private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"}) / 1e9
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.05]
               refId: C
 
   - orgId: 1
@@ -414,7 +455,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} found an instruction whose discriminator it supports but whose payload it cannot decode, so it is refusing to checkpoint past that slot; the deposit or withdrawal row that drives operator processing was never written. Unlike missing_meta the block itself is well-formed, so replaying the slot re-parses identical bytes and fails identically: retrying the same endpoint is a no-op. Repoint the datasource (for Yellowstone, the backfill gap-fill RPC) at an endpoint that serves innerInstructions with stackHeight, or fix the parser if a program's instruction layout changed. The indexer retries forever and reports zero lag while wedged, so this keys off the error counter. See docs/runbooks/indexer_parse_failed.md."
+          summary: "Indexer {{ $labels.program_type }} found an instruction whose discriminator it supports but whose payload it cannot decode, so it is refusing to checkpoint past that slot; the deposit or withdrawal row that drives operator processing was never written. Unlike missing_meta the block itself is well-formed, so replaying the slot re-parses identical bytes and fails identically: retrying the same endpoint is a no-op. Repoint the datasource (for Yellowstone, the backfill gap-fill RPC) at an endpoint that serves complete innerInstructions, or fix the parser if a program's instruction layout changed. The indexer retries forever and reports zero lag while wedged, so this keys off the error counter. See docs/runbooks/indexer_parse_failed.md."
         labels:
           severity: critical
         data:
@@ -453,7 +494,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} keeps hitting instructions its geyser stream cannot decode. No data is lost and the checkpoint is advancing: the reconnect gap-fill re-reads each slot over RPC, which has fuller metadata. The problem is that failing a block is how the stream withholds a slot, so a systematic cause (most often a feed that omits stackHeight on inner instructions, which makes every CPI deposit undecodable) tears the stream down once per affected block. The geyser feed is then contributing nothing while the backfill RPC does its work, at the cost of continuous reconnects and archival traffic. Not an emergency, unlike parse_failed, which means the checkpoint is actually stuck. Repoint the geyser provider at one that emits stackHeight, or drop to the RPC-polling datasource and stop paying for the feed. See docs/runbooks/indexer_parse_failed.md."
+          summary: "Indexer {{ $labels.program_type }} keeps hitting instructions its geyser stream cannot decode. No data is lost and the checkpoint is advancing: the reconnect gap-fill re-reads each slot over RPC, which has fuller metadata. The problem is that failing a block is how the stream withholds a slot, so a systematic cause (most often a feed with incomplete inner instructions, which leaves CPI deposits without their event) tears the stream down once per affected block. The geyser feed is then contributing nothing while the backfill RPC does its work, at the cost of continuous reconnects and archival traffic. Not an emergency, unlike parse_failed, which means the checkpoint is actually stuck. Repoint the geyser provider at one that emits complete inner instructions, or drop to the RPC-polling datasource and stop paying for the feed. See docs/runbooks/indexer_parse_failed.md."
         labels:
           severity: warning
         data:
@@ -609,7 +650,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} keeps receiving geyser blocks whose parent is not the last block it forwarded, so the provider is dropping finalized blocks. Each hole is re-read over RPC by the gap-fill, but if drops outpace fills the checkpoint stops moving. Switch provider or datasource. See docs/runbooks/indexer_parse_failed.md."
+          summary: "Indexer {{ $labels.program_type }} keeps receiving geyser blocks whose parent is not the last block it forwarded, or finalized slots whose blocks never arrive, so the provider is dropping finalized blocks. Each hole is re-read over RPC by the gap-fill, but if drops outpace fills the checkpoint stops moving. Switch provider or datasource. See docs/runbooks/indexer_parse_failed.md."
         labels:
           severity: warning
         data:
@@ -928,6 +969,40 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: pending-remint-backlog-unreadable
+        title: "Withdraw sender cannot read the pending remint backlog"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) keeps failing to read the next page of pending remints from the database. Refunds already loaded still run, but rows not yet loaded wait until the read succeeds. The error is in the sender log. Check the operator's database connection and any pending_remint row that fails to decode."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="pending_remint_page_read_failed"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
       - uid: reconciliation-inputs-dark
         title: "Reconciliation cannot read a required input"
         condition: C
@@ -946,6 +1021,45 @@ groups:
             datasourceUid: prometheus
             model:
               expr: max by (job, program_type) (private_channel_operator_reconciliation_input_dark_ticks)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: operator-alert-delivery-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: alerts-dropped
+        title: "Operator dropped transaction alerts; the webhook stream is incomplete"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) dropped transaction alert webhooks ({{ $labels.error_reason }}): its alert queue was full, a shutdown drain ran out of time, or a post failed (the endpoint errored or did not answer within 10s), most likely because the webhook endpoint is down, slow or hanging. The dropped transactions are recorded in the database and each logged its ERROR line, but nobody was paged for them. A shutdown drop logs their ids as transaction_ids; a failed post logs its id in a 'Failed to send webhook alert for transaction' WARN line. Check the webhook endpoint, then list recent outcomes with: SELECT id, transaction_type, status, updated_at FROM transactions WHERE status IN ('manual_review', 'failed', 'failed_reminted') ORDER BY updated_at DESC."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason=~"alert_queue_full|alert_drain_dropped|alert_post_failed"}[5m])
               instant: true
               refId: A
           - refId: C

@@ -43,7 +43,7 @@ pub enum OperatorError {
     WebhookError(String),
 
     #[error(
-        "Mint {mint} has no allowed status in mint_status_history at the deposit's slot (transaction {transaction_id}); refusing to mint"
+        "Mint {mint} has no allowed status in mint_status_history coming into or inside the deposit's slot (transaction {transaction_id}); refusing to mint"
     )]
     MintNotAllowed { transaction_id: i64, mint: String },
 
@@ -54,4 +54,9 @@ pub enum OperatorError {
         "The {program_type:?} sender lock was lost during the boot pre-flight; refusing to start"
     )]
     SenderLockLostAtBoot { program_type: crate::ProgramType },
+
+    /// A supervised worker exited on its own. Returned after the rest drain, so the process
+    /// exits nonzero and its supervisor treats the stop as a failure.
+    #[error("Critical operator task {task} exited; the operator stopped")]
+    CriticalTaskExited { task: &'static str },
 }

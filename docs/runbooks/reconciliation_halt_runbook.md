@@ -32,7 +32,21 @@ mint, each with its own consecutive-tick counter:
 On-chain supply is already net of burns (the program burns channel tokens at
 withdrawal initiation, not at release), so the supply check does **not** trust
 the DB ledger; it catches over-issuance. Its halt reason reads
-`... custody <C> short of supply by <GAP>, envelope <E> tolerance <T> ...`.
+`... custody <C> short of supply by <GAP>, envelope <E> (adjustment <A>) tolerance <T> ...`.
+
+A snapshot can be older than a transfer that already settled: custody read below a
+completed deposit's Solana slot, or supply read below a released withdrawal's burn.
+So the allowance also counts settled deposits above the tick's lowest custody slot and
+settled withdrawals above the channel block the supply reads were checked against; that
+part is the adjustment `<A>`, exported per mint as
+`private_channel_operator_reconciliation_envelope_adjustment_raw`. When the adjustment is
+the only thing keeping a mint from breaching, the operator logs
+`RECONCILIATION ALERT` and posts `{"alert": "envelope_adjustment_changed_verdict", ...}`
+to the reconciliation webhook. Such a masked tick holds the mint's breach count rather
+than resetting it, so a shortfall masked on some ticks still halts once it breaches on
+three ticks that are not clean. One such page is expected under RPC lag; pages that keep
+coming mean a lagging backend could be hiding a real shortfall of that size, so check
+the custody RPC and the channel read node for lag.
 
 The liability check catches a custody drain that the supply check cannot see
 while unminted (`pending`, `failed`, `manual_review`) deposits pad the gap.
@@ -204,7 +218,8 @@ the halt reason:
    `finalized`. This is authoritative custody. Other token accounts the escrow PDA
    owns (`getTokenAccountsByOwner`) are not custody: the program never moves them. See [`_verify_onchain_release.md`](_verify_onchain_release.md).
 2. **On-chain PrivateChannel supply.** Read the channel mint's `Mint.supply`
-   (`getAccountInfo` on the mint, decode the SPL Mint). This is the total minted,
+   (`getAccountInfo` on the mint, decode the SPL Mint; an account there not owned by
+   SPL Token means nothing was minted, supply 0). This is the total minted,
    already net of burns. `supply - custody` is the halt gap.
 3. **In-flight envelope.** Confirm the gap is not merely un-settled work:
 
@@ -252,12 +267,27 @@ a custody shortfall). Escalate per [`_escalation.md`](_escalation.md); rotate th
 operator/admin key if over-issuance is suspected, and do **not** resume the
 pipelines.
 
-Rotating the channel admin means migrating every receipt mint's authority to the
-new key with SPL `SetAuthority` first. The old key stays the on-chain
-`mint_authority` until you do, so deposits fail with `OwnerMismatch`
-(see [`deposit_failed.md`](deposit_failed.md)) and the old key keeps the ability to
-mint. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
-rotates on its own.
+Rotating the channel admin means replacing the old key with the new one in
+`PRIVATE_CHANNEL_ADMIN_KEYS` first, then migrating every receipt mint's mint and
+freeze authority to the new key with SPL `SetAuthority`, co-signed by the new
+admin as fee payer. Never migrate while the old key is still listed: until it is
+removed, it can mint and withdraw alone. The old key stays the on-chain
+`mint_authority` until you migrate, so deposits fail with `OwnerMismatch` (see
+[`deposit_failed.md`](deposit_failed.md)). This is separate
+from the escrow `Instance.admin`, which `SetNewAdmin` rotates on its own. Resync
+reads each receipt mint's own history as well as the new admin's, so deposits
+the old key minted before the rotation stay terminal.
+
+The old key also stays each mint's withdraw-fee treasury, exempt from the fee
+and minimum, until a deposit of that mint rewrites it. Sweep its collected fees
+before rotating: once the treasury switches they are an ordinary balance, and
+anything below the minimum plus the fee is stuck. The sweep and `SetAuthority` can
+run under the halt, but the deposit that rewrites the treasury cannot mint until the
+flag is cleared. After [Recover](#recover-only-after-backing-is-confirmed), make a
+small deposit per allowed mint, and check that each mint's
+[`WithdrawConfig.treasury`](../WITHDRAW_PROGRAM.md#withdrawconfig) names the new
+key before treating the rotation as complete. If the old key was compromised,
+block withdrawals per mint until then.
 
 ## Recover (only after backing is confirmed)
 

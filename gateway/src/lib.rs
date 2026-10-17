@@ -3,17 +3,20 @@ pub mod db;
 pub mod metrics;
 
 use crate::auth::{
-    auth_unavailable_body, check_account_data_ownership, check_request_auth, db_error_body,
-    decode_account_data, forbidden_body, is_gated, is_owner_only, redacts_transaction_errors_for,
-    resolve_owned_slot_ranges, role_check_error_body, verify_bearer, AuthDecision, Role,
+    auth_unavailable_body, authority_is_in_account_data, check_account_data_ownership,
+    check_request_auth, db_error_body, decode_account_data, forbidden_body, is_gated,
+    is_owner_only, redacts_transaction_errors_for, requested_data_slice, resolve_owned_slot_ranges,
+    role_check_error_body, token_account_amount, verify_bearer, AuthDecision, DataSlice, Role,
 };
 use crate::db::get_user_role;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use clap::Parser;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -27,14 +30,61 @@ use socket2::{SockRef, TcpKeepalive};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// Error type of every response body the gateway returns.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Metric error type for a forwarded request that ran past `Limits::upstream_timeout`.
+const UPSTREAM_TIMEOUT: &str = "upstream_timeout";
+
+/// Metric error type for authorization that ran past `Limits::upstream_timeout`.
+const AUTH_TIMEOUT: &str = "auth_timeout";
+
+/// Metric label for a public read shed because `Limits::max_forwarded_reads` was reached.
+const READ_CAPACITY: &str = "read_capacity";
+
+/// Methods that scan the blocks table and so share the block listing slots.
+const BLOCK_LIST_METHODS: &[&str] = &["getBlocks", "getBlocksWithLimit"];
+
+/// Metric label for a public block listing shed because every block listing slot was taken.
+const BLOCK_LIST_CAPACITY: &str = "block_list_capacity";
+
+/// The read node's default and maximum Postgres pool size, which the gateway must mirror.
+const DEFAULT_READ_POOL_SIZE: u32 = 32;
+const MAX_READ_POOL_SIZE: u32 = 256;
+
+/// Reads the pool size as the read node does, so one setting never starts one and stops the
+/// other: unset, empty, unparseable or zero means the default, and larger values are clamped.
+fn resolve_read_pool_size(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_READ_POOL_SIZE))
+        .unwrap_or(DEFAULT_READ_POOL_SIZE)
+}
+
+/// Metric error type for a request the auth path refused, by the status it was
+/// refused with, so a bad config or an outage is not counted as a rejected caller.
+fn auth_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_params",
+        StatusCode::INTERNAL_SERVER_ERROR => "auth_db_error",
+        StatusCode::BAD_GATEWAY => "backend_error",
+        StatusCode::SERVICE_UNAVAILABLE => "auth_fetch_unavailable",
+        _ => "auth_rejected",
+    }
+}
 
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
@@ -50,6 +100,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getTokenAccountBalance",
     "getLatestBlockhash",
     "getSignatureStatuses",
+    "getSignatureStatusSnapshot",
     "getTransactionCount",
     "getFirstAvailableBlock",
     "getBlocks",
@@ -64,6 +115,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "isBlockhashValid",
     "getSignaturesForAddress",
     "simulateTransaction",
+    "getAddressIndexSlot",
 ];
 
 #[derive(Parser, Debug, Clone)]
@@ -114,16 +166,27 @@ pub struct Args {
     /// that hits a gated method occupies one connection for the ownership
     /// check, so this should be sized to match expected peak concurrency.
     #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
-    pub auth_database_max_connections: u32,
+    pub auth_database_max_connections: NonZeroU32,
 
     /// Maximum number of concurrent client connections per listener. Connections
     /// beyond this are dropped so a flood cannot exhaust file descriptors or memory.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS", default_value = "1024")]
     pub max_connections: NonZeroUsize,
 
-    /// Maximum concurrent connections from a single client IP.
+    /// Maximum concurrent connections from a single client IP. Must be below
+    /// max_connections, so one client cannot take every slot.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS_PER_IP", default_value = "64")]
     pub max_connections_per_ip: NonZeroUsize,
+
+    /// Maximum public requests forwarded to the read node at once. Must be below
+    /// max_connections, so writes always find a free connection slot.
+    #[arg(long, env = "GATEWAY_MAX_FORWARDED_READS", default_value = "768")]
+    pub max_forwarded_reads: NonZeroUsize,
+
+    /// The read node's Postgres pool size. Sizes the cap on public block listings in flight,
+    /// so it is read exactly as the read node reads it: see `resolve_read_pool_size`.
+    #[arg(long, env = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS")]
+    pub read_node_pg_max_connections: Option<String>,
 
     /// Seconds a client may take to send the full request header block before
     /// the connection is closed (slowloris protection). Must be non-zero; a
@@ -155,6 +218,17 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub auth_fetch_timeout_secs: u64,
+
+    /// Seconds a request may take, from authorization until its response is written to the
+    /// client, 1 to 3600. A stalled node and a client that reads slowly or not at all hit it
+    /// alike: the caller gets a 504, or the connection is closed and its slots released.
+    #[arg(
+        long,
+        env = "GATEWAY_UPSTREAM_TIMEOUT_SECS",
+        default_value = "30",
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    pub upstream_timeout_secs: u64,
 
     /// Idle seconds before the OS starts sending TCP keepalive probes. Must be
     /// non-zero.
@@ -208,8 +282,15 @@ pub struct Limits {
     /// accepts up to twice this, though only the public one is floodable.
     pub max_connections: NonZeroUsize,
     /// Max concurrent connections from a single client IP, so one host cannot
-    /// consume the whole global connection budget.
+    /// consume the whole global connection budget. `run` requires it strictly below
+    /// `max_connections`, which reserves one slot; the struct itself does not check.
     pub max_connections_per_ip: NonZeroUsize,
+    /// Max public requests in flight to the read node. Reads past it get a 503,
+    /// so a stalled read node can't take the slots writes need.
+    pub max_forwarded_reads: NonZeroUsize,
+    /// Max public `getBlocks` and `getBlocksWithLimit` calls in flight, of any span. More
+    /// get a 503, so block listings can never hold most of the read node's Postgres pool.
+    pub max_forwarded_block_lists: NonZeroUsize,
     /// Max time a client may take to send the full request header block.
     /// Slowloris header-trickle connections are closed after this.
     pub header_read_timeout: Duration,
@@ -220,6 +301,9 @@ pub struct Limits {
     /// covering the request and the response body together. A hung read node
     /// fails the gated request with 503 instead of parking it.
     pub auth_fetch_timeout: Duration,
+    /// Max time per request, from authorization until the response is written to the client. A
+    /// client that reads slowly or stops reading can trip `upstream_timeout` with a healthy node.
+    pub upstream_timeout: Duration,
     /// Idle time before the OS starts sending TCP keepalive probes.
     pub tcp_keepalive_idle: Duration,
     /// Interval between TCP keepalive probes.
@@ -235,14 +319,30 @@ impl Default for Limits {
         Self {
             max_connections: NonZeroUsize::new(1024).unwrap(),
             max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
+            max_forwarded_reads: NonZeroUsize::new(768).unwrap(),
+            max_forwarded_block_lists: Self::block_list_slots(DEFAULT_READ_POOL_SIZE),
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
             auth_fetch_timeout: Duration::from_secs(3),
+            upstream_timeout: Duration::from_secs(30),
             tcp_keepalive_idle: Duration::from_secs(60),
             tcp_keepalive_interval: Duration::from_secs(15),
             rate_limit_per_second: NonZeroU32::new(50).unwrap(),
             rate_limit_burst: NonZeroU32::new(100).unwrap(),
         }
+    }
+}
+
+impl Limits {
+    /// Block listing slots for a read node pool of `pool_size`: a quarter of it, so
+    /// public listings of any span leave most connections to other reads.
+    pub fn block_list_slots(pool_size: u32) -> NonZeroUsize {
+        NonZeroUsize::new(pool_size as usize / 4).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// Listing slots one client may hold: a quarter of them, so one address cannot take them all.
+    fn block_lists_per_ip(&self) -> usize {
+        (self.max_forwarded_block_lists.get() / 4).max(1)
     }
 }
 
@@ -267,6 +367,12 @@ pub struct Gateway {
     /// Cached auth-DB role confirmations, keyed by user id. Lets a token's
     /// Operator claim be re-checked without a DB lookup on every request.
     role_cache: Arc<Mutex<HashMap<Uuid, CachedRole>>>,
+    /// Permits for public requests in flight to the read node, sized by `max_forwarded_reads`.
+    read_slots: Arc<Semaphore>,
+    /// Permits for public block listings in flight, sized by `max_forwarded_block_lists`.
+    block_list_slots: Arc<Semaphore>,
+    /// Listing slots each client holds, capped by `Limits::block_lists_per_ip`.
+    block_list_ip_counts: IpConnCounts,
 }
 
 #[derive(Clone, Copy)]
@@ -296,6 +402,8 @@ enum AccountFetch {
     Found {
         data: Vec<u8>,
         program_owner: String,
+        /// The slot the node answered at.
+        context_slot: u64,
     },
     NotFound,
     Unavailable,
@@ -312,6 +420,8 @@ struct CallPolicy {
     /// Inclusive slot windows this caller owned the address for, passed to the
     /// node so `limit` counts rows they may see. `None` asks for everything.
     slot_ranges: Option<Vec<(i64, i64)>>,
+    /// What the response must be held to before it reaches the caller.
+    response_check: Option<ResponseCheck>,
 }
 
 impl CallPolicy {
@@ -320,8 +430,33 @@ impl CallPolicy {
         Self {
             redact_errors: false,
             slot_ranges: None,
+            response_check: None,
         }
     }
+}
+
+/// The ownership fetch and the forwarded read are separate reads, and may reach
+/// replicas at different heights, so an account whose authority lives in its
+/// bytes can change hands between them. The response is held to the bytes the
+/// caller is authorized on.
+enum ResponseCheck {
+    /// Run the ownership check again on the whole account the response
+    /// carries, unless it is the account already authorized, then cut the
+    /// caller's `data_slice` from it.
+    AccountBytes {
+        user_id: Uuid,
+        pubkey: String,
+        data_slice: Option<DataSlice>,
+        authorized_program_owner: String,
+        authorized_data: Vec<u8>,
+    },
+    /// Serve the balance held in the bytes that passed the check, at the slot
+    /// they were read at. `amount` is `None` when those bytes were not a token
+    /// account and so held no balance.
+    AuthorizedBalance {
+        amount: Option<u64>,
+        context_slot: u64,
+    },
 }
 
 /// Add the caller's slot scope to an outgoing `getSignaturesForAddress`.
@@ -342,6 +477,41 @@ fn apply_slot_ranges(request: &mut Value, ranges: &[(i64, i64)]) {
         params[1] = serde_json::json!({});
     }
     params[1]["privateChannelSlotRanges"] = serde_json::json!(ranges);
+}
+
+/// Ask the node for the whole account in base64, keeping the rest of the
+/// caller's config, so the bytes checked are the bytes the reply is cut from.
+/// The config was already accepted by `requested_data_slice`.
+fn ask_for_whole_base64(request: &mut Value) {
+    let Some(params) = request.get_mut("params").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    if params.len() < 2 {
+        params.resize(2, Value::Null);
+    }
+    if !params[1].is_object() {
+        params[1] = serde_json::json!({});
+    }
+    params[1]["encoding"] = serde_json::json!("base64");
+    if let Some(config) = params[1].as_object_mut() {
+        config.remove("dataSlice");
+    }
+}
+
+/// `amount` base units as a decimal string with trailing zeros trimmed, the way
+/// the node's `real_number_string_trimmed` writes `uiAmountString`.
+fn ui_amount_string(amount: u64, decimals: u8) -> String {
+    let decimals = usize::from(decimals);
+    if decimals == 0 {
+        return amount.to_string();
+    }
+    // Padded so there is always a digit before the point.
+    let mut digits = format!("{amount:0width$}", width = decimals + 1);
+    digits.insert(digits.len() - decimals, '.');
+    digits
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 /// Tracks how many connections each client IP currently holds. Entries are
@@ -413,11 +583,231 @@ impl Drop for IpConnGuard {
     }
 }
 
-/// A `JWT_SECRET` counts as "configured" only if non-empty after trimming, mirroring the
-/// auth service so a whitespace-only secret doesn't enable gateway RBAC while auth refuses
-/// to start.
+/// A public listing's share of the client's quota and of the global listing budget.
+struct BlockListSlot {
+    client: IpConnGuard,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Upstream response body that errors once the request deadline passes, even mid-stream. An
+/// error, unlike a clean end, makes hyper drop the connection, so a cut-off page can't pass as complete.
+struct DeadlineBody {
+    inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    /// Held until the body ends, so a streaming read keeps its read slot.
+    _read_permit: Option<OwnedSemaphorePermit>,
+    /// Held until the body ends, so one slow-reading client cannot pin more than its share.
+    _block_list_client: Option<IpConnGuard>,
+}
+
+impl DeadlineBody {
+    fn new(
+        inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
+        deadline: tokio::time::Instant,
+        read_permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep_until(deadline)),
+            _read_permit: read_permit,
+            _block_list_client: None,
+        }
+    }
+
+    fn with_block_list_client(mut self, client: Option<IpConnGuard>) -> Self {
+        self._block_list_client = client;
+        self
+    }
+}
+
+impl Body for DeadlineBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        // Check the clock first, so an upstream with a frame always ready still stops at the deadline.
+        if tokio::time::Instant::now() < this.sleep.deadline() {
+            if let Poll::Ready(frame) = Pin::new(&mut this.inner).poll_frame(cx) {
+                return Poll::Ready(frame);
+            }
+            // Polling the sleep also registers the wakeup for when the deadline passes.
+            if this.sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+        metrics::GATEWAY_ERRORS_TOTAL
+            .with_label_values(&[UPSTREAM_TIMEOUT])
+            .inc();
+        Poll::Ready(Some(Err("upstream response deadline exceeded".into())))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Deadline for the response being written on one client connection.
+type WriteDeadline = Arc<Mutex<Option<tokio::time::Instant>>>;
+
+/// Client socket whose writes fail once the current response's deadline passes. hyper stops
+/// polling the response body while a client isn't reading, so the deadline has to fire here.
+struct DeadlineIo<T> {
+    inner: T,
+    deadline: WriteDeadline,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> DeadlineIo<T> {
+    fn new(inner: T, deadline: WriteDeadline) -> Self {
+        Self {
+            inner,
+            deadline,
+            sleep: None,
+        }
+    }
+
+    /// Passes a write result through, failing it if it is stuck past the deadline. A stuck
+    /// write also arms a timer, so the connection is woken to fail even if nothing else happens.
+    fn bound<R>(
+        &mut self,
+        polled: Poll<std::io::Result<R>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<R>> {
+        if polled.is_ready() {
+            return polled;
+        }
+        let Some(deadline) = *self.deadline.lock().unwrap() else {
+            return polled;
+        };
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if sleep.deadline() != deadline {
+            sleep.as_mut().reset(deadline);
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client did not read the response before the deadline",
+            )));
+        }
+        polled
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for DeadlineIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for DeadlineIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.bound(polled, cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.bound(polled, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_flush(cx);
+        this.bound(polled, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.bound(polled, cx)
+    }
+}
+
+/// Rejects limits that would let reads or one client take every connection slot.
+fn check_limits(limits: &Limits) -> Result<(), String> {
+    // Strictly below, so at least one slot is left for other clients.
+    if limits.max_connections_per_ip >= limits.max_connections {
+        return Err(format!(
+            "GATEWAY_MAX_CONNECTIONS_PER_IP ({}) must be below GATEWAY_MAX_CONNECTIONS ({}), \
+             or one client can take the whole budget and the per-IP cap never applies",
+            limits.max_connections_per_ip, limits.max_connections
+        ));
+    }
+    if limits.max_forwarded_reads >= limits.max_connections {
+        return Err(format!(
+            "GATEWAY_MAX_FORWARDED_READS ({}) must be below GATEWAY_MAX_CONNECTIONS ({})",
+            limits.max_forwarded_reads, limits.max_connections
+        ));
+    }
+    Ok(())
+}
+
+/// Every response carries the origin as a header, so one that is not a valid header
+/// value would fail each response instead of the startup.
+fn check_cors_origin(origin: &str) -> Result<(), String> {
+    hyper::header::HeaderValue::from_str(origin)
+        .map(|_| ())
+        .map_err(|_| {
+            format!("GATEWAY_CORS_ALLOWED_ORIGIN ({origin:?}) is not a valid HTTP header value")
+        })
+}
+
+/// Lenient trim used by `Gateway::new`, which is not a validated entry point: a library
+/// caller handing it a blank or whitespace-only secret gets RBAC off. `run` applies the
+/// strict rule in `resolve_jwt_secret` before any `Gateway` is built.
 fn configured_secret(secret: Option<&str>) -> Option<&str> {
     secret.filter(|s| !s.trim().is_empty())
+}
+
+/// Shortest accepted JWT signing secret, measured after trimming whitespace.
+const MIN_JWT_SECRET_BYTES: usize = 32;
+
+/// Startup rule for `JWT_SECRET`, identical to the auth service's (auth is only a
+/// dev-dependency here, so the rule is repeated and both sides pin the same vectors).
+/// An absent or empty value means RBAC off. Anything else must be at least 32 bytes after
+/// trimming, so a whitespace-only value cannot silently disable auth while auth signs
+/// with it. The key stays the raw value. The error never includes the secret.
+fn resolve_jwt_secret(secret: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let trimmed_len = secret.trim().len();
+    if trimmed_len < MIN_JWT_SECRET_BYTES {
+        return Err(format!(
+            "JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes after trimming \
+             whitespace (got {trimmed_len}); leave it empty to run without auth, or \
+             generate one with `openssl rand -hex 32`"
+        ));
+    }
+    Ok(Some(secret))
 }
 
 /// A blank `GATEWAY_INTERNAL_PORT` means "no internal listener", the same way a
@@ -548,12 +938,19 @@ impl Gateway {
             auth_db,
             ready_cache: Arc::new(AsyncMutex::new(None)),
             role_cache: Arc::new(Mutex::new(HashMap::new())),
+            read_slots: Arc::new(Semaphore::new(Limits::default().max_forwarded_reads.get())),
+            block_list_slots: Arc::new(Semaphore::new(
+                Limits::default().max_forwarded_block_lists.get(),
+            )),
+            block_list_ip_counts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Overrides the default resource limits.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self.read_slots = Arc::new(Semaphore::new(limits.max_forwarded_reads.get()));
+        self.block_list_slots = Arc::new(Semaphore::new(limits.max_forwarded_block_lists.get()));
         self
     }
 
@@ -724,9 +1121,21 @@ impl Gateway {
             return AccountFetch::Unavailable;
         };
 
+        // The slot these bytes were read at, so a reply built from them can say so.
+        let Some(context_slot) = json
+            .get("result")
+            .and_then(|result| result.get("context"))
+            .and_then(|context| context.get("slot"))
+            .and_then(Value::as_u64)
+        else {
+            warn!("Ownership account fetch returned an account with no context slot");
+            return AccountFetch::Unavailable;
+        };
+
         AccountFetch::Found {
             data,
             program_owner: program_owner.to_owned(),
+            context_slot,
         }
     }
 
@@ -734,7 +1143,7 @@ impl Gateway {
         &self,
         status: StatusCode,
         body: Option<Bytes>,
-    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
         let mut builder = Response::builder().status(status).header(
             "Access-Control-Allow-Origin",
             self.cors_allowed_origin.as_str(),
@@ -754,6 +1163,20 @@ impl Gateway {
                 .body(Empty::new().map_err(|never| match never {}).boxed_unsync())
                 .unwrap(),
         }
+    }
+
+    /// Error that also closes the connection, so pipelined requests can't queue behind a stalled node.
+    fn closing_error_response(
+        &self,
+        status: StatusCode,
+        body: Option<Bytes>,
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
+        let mut response = self.error_response(status, body);
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+        response
     }
 
     /// Confirms whether `user_id` currently holds the Operator role in the auth
@@ -791,16 +1214,16 @@ impl Gateway {
         Ok(is_operator)
     }
 
-    /// Records an auth-rejection metric and builds the error response.
+    /// Records an auth-path failure metric and builds the error response.
     fn reject_with_metrics(
         &self,
         method_label: &str,
         status: StatusCode,
         body: Bytes,
         start: Instant,
-    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
         Self::record_metrics(
-            Some("auth_rejected"),
+            Some(auth_error_type(status)),
             method_label,
             "none",
             &status.as_u16().to_string(),
@@ -826,7 +1249,7 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Result<CallPolicy, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
+    ) -> Result<CallPolicy, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>>>
     {
         // Auth off, so nothing is redacted either. Every method is ungated in this
         // mode, so a caller reads the balance straight from getTokenAccountBalance
@@ -870,6 +1293,7 @@ impl Gateway {
             return Ok(CallPolicy {
                 redact_errors: redacts_transaction_errors_for(claims.as_ref(), method),
                 slot_ranges: None,
+                response_check: None,
             });
         }
 
@@ -893,6 +1317,7 @@ impl Gateway {
                 return Ok(CallPolicy {
                     redact_errors: redact,
                     slot_ranges: None,
+                    response_check: None,
                 })
             }
             AuthDecision::Reject(status, body) => (status, body),
@@ -902,6 +1327,7 @@ impl Gateway {
                     AccountFetch::Found {
                         data,
                         program_owner,
+                        ..
                     } => {
                         check_account_data_ownership(
                             data,
@@ -931,12 +1357,14 @@ impl Gateway {
                                 AccountFetch::Found {
                                     data,
                                     program_owner,
+                                    context_slot,
                                 },
                                 true,
                             ) => match resolve_owned_slot_ranges(
                                 data,
                                 program_owner,
                                 &pubkey,
+                                *context_slot,
                                 user_id,
                                 auth_db,
                             )
@@ -954,9 +1382,51 @@ impl Gateway {
                             },
                             _ => None,
                         };
+                        // The forwarded read may see the account after it changed
+                        // hands, so it is held to the bytes this check was made on.
+                        let response_check = match &fetched {
+                            AccountFetch::Found {
+                                data,
+                                program_owner,
+                                ..
+                            } if method == "getAccountInfo"
+                                && authority_is_in_account_data(program_owner) =>
+                            {
+                                let data_slice = match requested_data_slice(params) {
+                                    Ok(data_slice) => data_slice,
+                                    Err(body) => {
+                                        return Err(self.reject_with_metrics(
+                                            method_label,
+                                            StatusCode::BAD_REQUEST,
+                                            body,
+                                            start,
+                                        ))
+                                    }
+                                };
+                                Some(ResponseCheck::AccountBytes {
+                                    user_id,
+                                    pubkey: pubkey.clone(),
+                                    data_slice,
+                                    authorized_program_owner: program_owner.clone(),
+                                    authorized_data: data.clone(),
+                                })
+                            }
+                            AccountFetch::Found {
+                                data,
+                                program_owner,
+                                context_slot,
+                            } if method == "getTokenAccountBalance" => {
+                                Some(ResponseCheck::AuthorizedBalance {
+                                    amount: token_account_amount(data, program_owner),
+                                    context_slot: *context_slot,
+                                })
+                            }
+                            _ => None,
+                        };
                         return Ok(CallPolicy {
                             redact_errors: redact,
                             slot_ranges,
+                            response_check,
                         });
                     }
                     AuthDecision::Reject(status, body) => (status, body),
@@ -965,21 +1435,149 @@ impl Gateway {
             }
         };
 
-        // A 503 here is an upstream failure, not a rejected caller, so it stays out
-        // of the auth-rejection panel.
-        let error_type = if status == StatusCode::SERVICE_UNAVAILABLE {
-            "auth_fetch_unavailable"
-        } else {
-            "auth_rejected"
-        };
         Self::record_metrics(
-            Some(error_type),
+            Some(auth_error_type(status)),
             method_label,
             "none",
             &status.as_u16().to_string(),
             start.elapsed().as_secs_f64(),
         );
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(self.closing_error_response(status, Some(body)));
+        }
         Err(self.error_response(status, Some(body)))
+    }
+
+    /// Hold a buffered response to what its caller was authorized on. `Ok`
+    /// carries the body to serve, `Err` the status and body to refuse with.
+    async fn check_response(
+        &self,
+        check: &ResponseCheck,
+        method: &str,
+        body: Bytes,
+    ) -> Result<Bytes, (StatusCode, Option<Bytes>)> {
+        let Some(auth_db) = &self.auth_db else {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Some(db_error_body())));
+        };
+        // Not JSON, so not the node's answer: a load balancer's 429 or 503 page.
+        // No client parses an account out of it, and serving it keeps the
+        // upstream status clients retry on.
+        let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
+            return Ok(body);
+        };
+
+        match check {
+            ResponseCheck::AuthorizedBalance {
+                amount: authorized,
+                context_slot,
+            } => {
+                // An error carries no balance.
+                let Some(result) = json.get_mut("result") else {
+                    return Ok(body);
+                };
+                let Some(value) = result.get_mut("value") else {
+                    return Ok(body);
+                };
+                // Decimals belong to the mint, which the account's address fixes
+                // and whose decimals never change, so the node's read holds.
+                let decimals = value
+                    .get("decimals")
+                    .and_then(Value::as_u64)
+                    .and_then(|decimals| u8::try_from(decimals).ok());
+                let (Some(amount), Some(decimals)) = (*authorized, decimals) else {
+                    return Err((StatusCode::BAD_GATEWAY, None));
+                };
+                value["amount"] = Value::from(amount.to_string());
+                value["uiAmount"] = Value::from(amount as f64 / 10_f64.powi(i32::from(decimals)));
+                value["uiAmountString"] = Value::from(ui_amount_string(amount, decimals));
+                // The slot the amount was read at, not the one the node answered at.
+                let Some(context) = result.get_mut("context").and_then(Value::as_object_mut) else {
+                    return Err((StatusCode::BAD_GATEWAY, None));
+                };
+                context.insert("slot".to_string(), Value::from(*context_slot));
+                Ok(Bytes::from(json.to_string()))
+            }
+            ResponseCheck::AccountBytes {
+                user_id,
+                pubkey,
+                data_slice,
+                authorized_program_owner,
+                authorized_data,
+            } => {
+                // An error carries no account, and a null value is one closed
+                // since the check. Neither shows anyone's state.
+                let Some(account) = json
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .filter(|value| !value.is_null())
+                else {
+                    return Ok(body);
+                };
+                let program_owner = account
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let served = match account
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                {
+                    Some([Value::String(encoded), Value::String(encoding)])
+                        if encoding == "base64" =>
+                    {
+                        decode_account_data(encoded)
+                    }
+                    _ => None,
+                };
+                let data = match served {
+                    Some(data) => data,
+                    // It was asked for in base64, so any other shape is the
+                    // node misbehaving.
+                    None if authority_is_in_account_data(program_owner) => {
+                        return Err((StatusCode::BAD_GATEWAY, None))
+                    }
+                    // A wallet's reader is decided by its address, not its bytes.
+                    None => Vec::new(),
+                };
+
+                // Identical to what was authorized, so that check's verdict holds
+                // and its wallet lookup is reused. A wallet unlinked between the
+                // two reads is still served, as it was before replies were
+                // checked at all; the gap is milliseconds. Compared whole, before
+                // any slice, so a cut of a changed account cannot match.
+                let unchanged =
+                    program_owner == authorized_program_owner.as_str() && data == *authorized_data;
+                if !unchanged {
+                    match check_account_data_ownership(
+                        &data,
+                        program_owner,
+                        pubkey,
+                        method,
+                        *user_id,
+                        auth_db,
+                    )
+                    .await
+                    {
+                        AuthDecision::Proceed => {}
+                        AuthDecision::Reject(status, rejection) => {
+                            return Err((status, Some(rejection)))
+                        }
+                        AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
+                    }
+                }
+
+                // Cut from the bytes that passed, the way the node cuts: an
+                // offset past the end gives nothing, and a long slice stops there.
+                let Some(DataSlice { offset, length }) = data_slice else {
+                    return Ok(body);
+                };
+                let start = (*offset).min(data.len());
+                let end = start.saturating_add(*length).min(data.len());
+                json["result"]["value"]["data"] =
+                    serde_json::json!([BASE64.encode(&data[start..end]), "base64"]);
+                Ok(Bytes::from(json.to_string()))
+            }
+        }
     }
 
     /// Build a JSON-RPC–style error body for 413 responses.
@@ -1011,11 +1609,13 @@ impl Gateway {
         rate_key: IpAddr,
         rate_limiter: Arc<IpRateLimiter>,
         access: Access,
-    ) -> Result<
-        Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
-        hyper::Error,
-    > {
+        write_deadline: WriteDeadline,
+    ) -> Result<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>>, hyper::Error>
+    {
         let start = Instant::now();
+        // Every response must reach the client within the timeout, or the connection is closed.
+        *write_deadline.lock().unwrap() =
+            Some(tokio::time::Instant::now() + self.limits.upstream_timeout);
 
         if req.method() == hyper::Method::OPTIONS {
             return Ok(Response::builder()
@@ -1238,21 +1838,6 @@ impl Gateway {
             "unknown"
         };
 
-        // --- RBAC enforcement ---
-        // Skipped on the internal listener: the operator services carry no JWT,
-        // and they need the raw errors their confirmation handling routes on.
-        let params = json.get("params").cloned().unwrap_or(Value::Null);
-        let call_policy = match access {
-            Access::Internal => CallPolicy::passthrough(),
-            Access::Public => match self
-                .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
-                .await
-            {
-                Ok(policy) => policy,
-                Err(rejection) => return Ok(rejection),
-            },
-        };
-
         // isBlockhashValid must answer from the writer's own admission window.
         let (target_url, target_label) =
             if method == "sendTransaction" || method == "isBlockhashValid" {
@@ -1262,6 +1847,101 @@ impl Gateway {
                 info!("Routing {} to read node", method);
                 (&self.read_url, "read")
             };
+
+        // Public reads past the cap are shed at once, so a stalled read node can't fill the
+        // slots writes need. Taken before auth, so the ownership fetch counts too, and held
+        // until the exchange ends, streamed body included.
+        let read_permit = if access == Access::Public && target_label == "read" {
+            match Arc::clone(&self.read_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    warn!("Read capacity reached, shedding {}", method);
+                    metrics::GATEWAY_REJECTED_TOTAL
+                        .with_label_values(&[READ_CAPACITY])
+                        .inc();
+                    Self::record_metrics(
+                        Some(READ_CAPACITY),
+                        method_label,
+                        target_label,
+                        "503",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(self.closing_error_response(StatusCode::SERVICE_UNAVAILABLE, None));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Public listings of any span share a budget below the read node's pool, and each client
+        // gets only a share of it. Only this layer can tell them from the indexer's.
+        let block_list_permit = if access == Access::Public && BLOCK_LIST_METHODS.contains(&method)
+        {
+            let client = try_acquire_ip(
+                &self.block_list_ip_counts,
+                rate_key,
+                self.limits.block_lists_per_ip(),
+            );
+            let permit = client
+                .as_ref()
+                .and_then(|_| Arc::clone(&self.block_list_slots).try_acquire_owned().ok());
+            match (client, permit) {
+                (Some(client), Some(permit)) => Some(BlockListSlot {
+                    client,
+                    _permit: permit,
+                }),
+                _ => {
+                    warn!("Block listing capacity reached, shedding {}", method);
+                    metrics::GATEWAY_REJECTED_TOTAL
+                        .with_label_values(&[BLOCK_LIST_CAPACITY])
+                        .inc();
+                    Self::record_metrics(
+                        Some(BLOCK_LIST_CAPACITY),
+                        method_label,
+                        target_label,
+                        "503",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(self.closing_error_response(StatusCode::SERVICE_UNAVAILABLE, None));
+                }
+            }
+        } else {
+            None
+        };
+
+        // --- RBAC enforcement ---
+        // Skipped on the internal listener: the operator services carry no JWT,
+        // and they need the raw errors their confirmation handling routes on.
+        let params = json.get("params").cloned().unwrap_or(Value::Null);
+        // One deadline covers authorization and the upstream exchange, so a stalled auth
+        // database can't hold the connection or read permit any longer than a stalled node.
+        let deadline = tokio::time::Instant::now() + self.limits.upstream_timeout;
+        *write_deadline.lock().unwrap() = Some(deadline);
+        let call_policy = match access {
+            Access::Internal => CallPolicy::passthrough(),
+            Access::Public => {
+                let auth =
+                    self.enforce_auth(auth_header.as_deref(), method, method_label, &params, start);
+                match tokio::time::timeout_at(deadline, auth).await {
+                    Ok(Ok(policy)) => policy,
+                    Ok(Err(rejection)) => return Ok(rejection),
+                    Err(_) => {
+                        warn!(
+                            "Authorization for {} did not finish within {:?}",
+                            method, self.limits.upstream_timeout
+                        );
+                        Self::record_metrics(
+                            Some(AUTH_TIMEOUT),
+                            method_label,
+                            "none",
+                            "504",
+                            start.elapsed().as_secs_f64(),
+                        );
+                        return Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None));
+                    }
+                }
+            }
+        };
 
         let uri = match target_url.parse::<hyper::Uri>() {
             Ok(uri) => uri,
@@ -1289,6 +1969,14 @@ impl Gateway {
             }
             None => body_bytes,
         };
+        let body_bytes = match &call_policy.response_check {
+            Some(ResponseCheck::AccountBytes { .. }) => {
+                let mut whole = json.clone();
+                ask_for_whole_base64(&mut whole);
+                Bytes::from(whole.to_string())
+            }
+            _ => body_bytes,
+        };
 
         let forwarded_req = match Request::builder()
             .method(hyper::Method::POST)
@@ -1310,20 +1998,13 @@ impl Gateway {
             }
         };
 
-        match self.client.request(forwarded_req).await {
-            Ok(response) => {
+        match tokio::time::timeout_at(deadline, self.client.request(forwarded_req)).await {
+            Ok(Ok(response)) => {
                 let status = response.status().as_u16().to_string();
                 info!(
                     "Forwarded to {} - Status: {}",
                     target_url,
                     response.status()
-                );
-                Self::record_metrics(
-                    None,
-                    method_label,
-                    target_label,
-                    &status,
-                    start.elapsed().as_secs_f64(),
                 );
 
                 let (mut parts, body) = response.into_parts();
@@ -1341,19 +2022,105 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                if !call_policy.redact_errors {
+                if !call_policy.redact_errors && call_policy.response_check.is_none() {
+                    // The status line goes out now; a later body abort counts as upstream_timeout.
+                    Self::record_metrics(
+                        None,
+                        method_label,
+                        target_label,
+                        &status,
+                        start.elapsed().as_secs_f64(),
+                    );
+                    // The node's pool is free once headers arrive, so the global listing slot
+                    // goes now and only the client's share waits for the body.
+                    let body = DeadlineBody::new(
+                        body.map_err(BoxError::from).boxed_unsync(),
+                        deadline,
+                        read_permit,
+                    )
+                    .with_block_list_client(block_list_permit.map(|slot| slot.client));
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
-                // Rewriting the page means buffering it instead of streaming.
-                let collected = match body.collect().await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(e) => {
+                // Checking or rewriting the response means buffering it instead of streaming.
+                let collected = match tokio::time::timeout_at(deadline, body.collect()).await {
+                    Ok(Ok(collected)) => collected.to_bytes(),
+                    Ok(Err(e)) => {
                         error!("Failed to read response from {}: {}", target_url, e);
+                        Self::record_metrics(
+                            Some("backend_error"),
+                            method_label,
+                            target_label,
+                            "502",
+                            start.elapsed().as_secs_f64(),
+                        );
                         return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
                     }
+                    Err(_) => {
+                        warn!(
+                            "Response from {} stalled past {:?}",
+                            target_url, self.limits.upstream_timeout
+                        );
+                        Self::record_metrics(
+                            Some(UPSTREAM_TIMEOUT),
+                            method_label,
+                            target_label,
+                            "504",
+                            start.elapsed().as_secs_f64(),
+                        );
+                        return Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None));
+                    }
                 };
-                let rewritten = redact_transaction_errors(collected);
+                let checked = match &call_policy.response_check {
+                    None => collected,
+                    Some(check) => match tokio::time::timeout_at(
+                        deadline,
+                        self.check_response(check, method, collected),
+                    )
+                    .await
+                    {
+                        Ok(Ok(body)) => body,
+                        Ok(Err((status, body))) => {
+                            Self::record_metrics(
+                                Some(auth_error_type(status)),
+                                method_label,
+                                target_label,
+                                &status.as_u16().to_string(),
+                                start.elapsed().as_secs_f64(),
+                            );
+                            return Ok(self.error_response(status, body));
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Checking the response to {} did not finish within {:?}",
+                                method, self.limits.upstream_timeout
+                            );
+                            Self::record_metrics(
+                                Some(AUTH_TIMEOUT),
+                                method_label,
+                                target_label,
+                                "504",
+                                start.elapsed().as_secs_f64(),
+                            );
+                            return Ok(
+                                self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None)
+                            );
+                        }
+                    },
+                };
+                // Recorded once the body is in, so status and duration match what the client gets.
+                Self::record_metrics(
+                    None,
+                    method_label,
+                    target_label,
+                    &status,
+                    start.elapsed().as_secs_f64(),
+                );
+                let rewritten = if call_policy.redact_errors {
+                    redact_transaction_errors(checked)
+                } else {
+                    checked
+                };
 
                 // Rewriting changes the length, so let hyper re-frame the body.
                 parts.headers.remove(hyper::header::CONTENT_LENGTH);
@@ -1365,7 +2132,7 @@ impl Gateway {
                         .boxed_unsync(),
                 ))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Failed to forward request to {}: {}", target_url, e);
                 Self::record_metrics(
                     Some("backend_error"),
@@ -1375,6 +2142,20 @@ impl Gateway {
                     start.elapsed().as_secs_f64(),
                 );
                 Ok(self.error_response(StatusCode::BAD_GATEWAY, None))
+            }
+            Err(_) => {
+                warn!(
+                    "{} did not answer within {:?}",
+                    target_url, self.limits.upstream_timeout
+                );
+                Self::record_metrics(
+                    Some(UPSTREAM_TIMEOUT),
+                    method_label,
+                    target_label,
+                    "504",
+                    start.elapsed().as_secs_f64(),
+                );
+                Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None))
             }
         }
     }
@@ -1473,7 +2254,8 @@ pub async fn serve(
             warn!("Failed to set TCP keepalive for {ip}: {e}");
         }
 
-        let io = TokioIo::new(stream);
+        let write_deadline: WriteDeadline = Arc::new(Mutex::new(None));
+        let io = TokioIo::new(DeadlineIo::new(stream, Arc::clone(&write_deadline)));
         let gateway = Arc::clone(&gateway);
         let rate_limiter = Arc::clone(&rate_limiter);
 
@@ -1485,9 +2267,10 @@ pub async fn serve(
             let service = service_fn(move |req| {
                 let gateway = Arc::clone(&gateway);
                 let rate_limiter = Arc::clone(&rate_limiter);
+                let write_deadline = Arc::clone(&write_deadline);
                 async move {
                     gateway
-                        .handle_request(req, rate_key, rate_limiter, access)
+                        .handle_request(req, rate_key, rate_limiter, access, write_deadline)
                         .await
                 }
             });
@@ -1518,26 +2301,44 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("  Write URL: {}", args.write_url);
     info!("  Read URL: {}", args.read_url);
+    // Checked before it is logged, so a newline in it cannot forge a log line.
+    check_cors_origin(&args.cors_allowed_origin)?;
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
+
+    // Config rules run before anything connects, so a bad value never opens the pool.
+    let auth_enabled = resolve_jwt_secret(args.jwt_secret.as_deref())?.is_some();
     info!(
         "  Auth enforcement: {}",
-        if configured_secret(args.jwt_secret.as_deref()).is_some() {
-            "enabled"
-        } else {
-            "disabled"
-        }
+        if auth_enabled { "enabled" } else { "disabled" }
     );
+    let limits = Limits {
+        max_connections: args.max_connections,
+        max_connections_per_ip: args.max_connections_per_ip,
+        max_forwarded_reads: args.max_forwarded_reads,
+        max_forwarded_block_lists: Limits::block_list_slots(resolve_read_pool_size(
+            args.read_node_pg_max_connections.as_deref(),
+        )),
+        header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
+        body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
+        auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
+        upstream_timeout: Duration::from_secs(args.upstream_timeout_secs),
+        tcp_keepalive_idle: Duration::from_secs(args.tcp_keepalive_idle_secs),
+        tcp_keepalive_interval: Duration::from_secs(args.tcp_keepalive_interval_secs),
+        rate_limit_per_second: args.rate_limit_per_second,
+        rate_limit_burst: args.rate_limit_burst,
+    };
+    check_limits(&limits)?;
 
     // Refuse to start if JWT_SECRET is set without AUTH_DATABASE_URL.
     //
     // Auth is intentionally optional: both absent means "run without auth" and
     // is valid for local dev. But JWT_SECRET present without AUTH_DATABASE_URL
-    // is a misconfiguration — enforce_auth silently falls through to its wildcard
+    // is a misconfiguration: enforce_auth silently falls through to its wildcard
     // arm and returns None, disabling all enforcement with no indication. An
     // operator who sets JWT_SECRET believes auth is active; failing here at boot
     // ensures that belief is correct rather than every request passing through
     // unguarded at runtime.
-    if configured_secret(args.jwt_secret.as_deref()).is_some() && args.auth_database_url.is_none() {
+    if auth_enabled && args.auth_database_url.is_none() {
         return Err(
             "JWT_SECRET is set but AUTH_DATABASE_URL is not configured. \
              Auth enforcement requires both. Either provide AUTH_DATABASE_URL \
@@ -1551,7 +2352,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let auth_db = match args.auth_database_url {
         Some(ref url) => {
             let pool = PgPoolOptions::new()
-                .max_connections(args.auth_database_max_connections)
+                .max_connections(args.auth_database_max_connections.get())
                 .connect(url)
                 .await?;
             info!(
@@ -1565,18 +2366,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             info!("  Auth DB: not configured");
             None
         }
-    };
-
-    let limits = Limits {
-        max_connections: args.max_connections,
-        max_connections_per_ip: args.max_connections_per_ip,
-        header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
-        body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
-        auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
-        tcp_keepalive_idle: Duration::from_secs(args.tcp_keepalive_idle_secs),
-        tcp_keepalive_interval: Duration::from_secs(args.tcp_keepalive_interval_secs),
-        rate_limit_per_second: args.rate_limit_per_second,
-        rate_limit_burst: args.rate_limit_burst,
     };
 
     let gateway = Arc::new(
@@ -1870,7 +2659,7 @@ mod tests {
     /// land in the "unknown" bucket and disappear from the per-method panels.
     #[test]
     fn slot_enumeration_methods_have_their_own_metric_label() {
-        for method in ["getBlocks", "getBlocksWithLimit"] {
+        for method in ["getBlocks", "getBlocksWithLimit", "getAddressIndexSlot"] {
             assert!(
                 KNOWN_RPC_METHODS.contains(&method),
                 "{method} would be recorded under the \"unknown\" metric label"
@@ -2336,6 +3125,100 @@ mod tests {
         );
     }
 
+    /// A balance the gateway writes itself must read exactly as the node would
+    /// have written it.
+    #[test]
+    fn ui_amount_string_matches_the_node_formatting() {
+        for (amount, decimals, expected) in [
+            (1_234_500, 6, "1.2345"),
+            (1_000_000, 6, "1"),
+            (5, 6, "0.000005"),
+            (0, 6, "0"),
+            (42, 0, "42"),
+            (u64::MAX, 9, "18446744073.709551615"),
+        ] {
+            assert_eq!(
+                ui_amount_string(amount, decimals),
+                expected,
+                "{amount} at {decimals} decimals"
+            );
+        }
+    }
+
+    /// A bad config or an outage on the auth path is not a rejected caller, so
+    /// each is counted under what failed.
+    #[test]
+    fn auth_failures_are_labelled_by_what_failed() {
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, "invalid_params"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "auth_db_error"),
+            (StatusCode::BAD_GATEWAY, "backend_error"),
+            (StatusCode::SERVICE_UNAVAILABLE, "auth_fetch_unavailable"),
+            (StatusCode::UNAUTHORIZED, "auth_rejected"),
+            (StatusCode::FORBIDDEN, "auth_rejected"),
+        ] {
+            assert_eq!(auth_error_type(status), expected, "{status}");
+        }
+    }
+
+    /// A served account identical to the one already checked keeps that check's
+    /// verdict, wallet lookup included. The auth database here is unreachable,
+    /// so a second lookup would turn the reply into a 500.
+    #[tokio::test]
+    async fn an_unchanged_account_skips_the_second_wallet_lookup() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let unreachable = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgres://postgres:password@127.0.0.1:1/unused")
+            .unwrap();
+        let gateway = Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "*".to_string(),
+            Some(TEST_JWT_SECRET.to_string()),
+            Some(unreachable),
+        );
+
+        let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        let account_space = 165;
+        let mut account = vec![0u8; account_space];
+        account[32..64].copy_from_slice(&[7u8; 32]);
+        let body = Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "context": {"slot": 1},
+                    "value": {
+                        "lamports": 2_039_280,
+                        "owner": token_program,
+                        "data": [BASE64.encode(&account), "base64"],
+                        "executable": false,
+                        "rentEpoch": 0,
+                        "space": account_space
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let check = ResponseCheck::AccountBytes {
+            user_id: Uuid::nil(),
+            pubkey: bs58::encode([8u8; 32]).into_string(),
+            data_slice: None,
+            authorized_program_owner: token_program.to_string(),
+            authorized_data: account,
+        };
+
+        assert_eq!(
+            gateway
+                .check_response(&check, "getAccountInfo", body.clone())
+                .await,
+            Ok(body)
+        );
+    }
+
     /// Both legs of the balance probe (InsufficientFunds above the source
     /// balance, MintMismatch at or below it) must come back indistinguishable.
     #[test]
@@ -2445,13 +3328,25 @@ mod tests {
     /// Start a gateway with auth enforcement on. The auth pool is lazy and never
     /// connects: every path these tests exercise rejects before any DB query.
     async fn start_auth_gateway(read_url: &str, limits: Limits) -> SocketAddr {
+        start_auth_gateway_with_db(
+            read_url,
+            "postgres://postgres:password@127.0.0.1:1/unused",
+            limits,
+        )
+        .await
+    }
+
+    /// Like `start_auth_gateway`, with the auth database at `db_url`.
+    async fn start_auth_gateway_with_db(
+        read_url: &str,
+        db_url: &str,
+        limits: Limits,
+    ) -> SocketAddr {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
-        let auth_db = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:password@127.0.0.1:1/unused")
-            .unwrap();
+        let auth_db = PgPoolOptions::new().connect_lazy(db_url).unwrap();
         let gateway = Arc::new(
             Gateway::new(
                 "http://127.0.0.1:1".to_string(),
@@ -2475,9 +3370,14 @@ mod tests {
     /// Mint a User-role JWT the gateway accepts, so a gated request gets as far
     /// as the ownership account fetch.
     fn user_token() -> String {
+        token_with_role("user")
+    }
+
+    /// Mint a JWT the gateway accepts for `role`.
+    fn token_with_role(role: &str) -> String {
         let claims = json!({
             "sub": "11111111-1111-4111-8111-111111111111",
-            "role": "user",
+            "role": role,
             "exp": (Utc::now().timestamp() + 3600) as usize,
             "iss": "private-channel-auth",
             "aud": "private-channel-gateway",
@@ -2539,16 +3439,10 @@ mod tests {
             .await
             .unwrap();
 
-        // With the deadline the gateway answers ~300ms in. Without it the ownership
-        // fetch waits on the hung read node forever and this read hangs; the 3s
-        // bound turns that regression into a failure, not a stuck test.
-        let mut buf = vec![0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut buf))
-            .await
-            .expect("gateway should give up on the hung read node, not hang")
-            .unwrap();
+        // With the deadline the gateway answers ~300ms in and closes, so pipelined
+        // requests can't queue behind the hung node. Without either, this read hangs.
+        let response = read_to_close(&mut conn).await;
         let elapsed = start.elapsed();
-        let response = String::from_utf8_lossy(&buf[..n]);
 
         assert_status(&response, 503);
         // The backend holds the connection open, so the deadline is the only way
@@ -2558,6 +3452,71 @@ mod tests {
             elapsed >= Duration::from_millis(250),
             "expected the fetch deadline to fire, got a reply after {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ownership_fetch_counts_against_the_read_cap() {
+        // A gated read stalls in its ownership fetch while holding the only read slot.
+        let backend = start_black_hole_backend().await;
+        let addr = start_auth_gateway(
+            &format!("http://{backend}"),
+            Limits {
+                max_connections: NonZeroUsize::new(2).unwrap(),
+                auth_fetch_timeout: Duration::from_secs(5),
+                ..one_read_slot()
+            },
+        )
+        .await;
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        held.write_all(gated_request(&user_token()).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A second gated read is shed at once instead of queuing a second fetch.
+        let mut shed = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        shed.write_all(gated_request(&user_token()).as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut shed).await, 503);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // That leaves the second connection slot for a write; 502 means it was served,
+        // since this gateway's write node is unreachable.
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 502);
+    }
+
+    #[tokio::test]
+    async fn stalled_auth_database_is_bounded_by_the_deadline() {
+        // The auth database accepts connections and never answers, so the operator role check hangs.
+        let auth_db = start_black_hole_backend().await;
+        let read_node = start_mock_http_backend(r#"{"result":7}"#).await;
+        let addr = start_auth_gateway_with_db(
+            &format!("http://{read_node}"),
+            &format!("postgres://postgres:password@{auth_db}/unused"),
+            Limits {
+                max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+                ..stall_limits()
+            },
+        )
+        .await;
+
+        let timeouts_before = errors_recorded(AUTH_TIMEOUT);
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        stalled
+            .write_all(gated_request(&token_with_role("operator")).as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut stalled).await, 504);
+        assert_deadline_fired(start.elapsed());
+        assert!(errors_recorded(AUTH_TIMEOUT) > timeouts_before);
+
+        // The read slot it held is free again.
+        let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
+        assert_status(&response, 200);
     }
 
     #[tokio::test]
@@ -2588,5 +3547,1126 @@ mod tests {
 
         let response = send_raw(addr, gated_request(&user_token()).as_bytes()).await;
         assert_status(&response, 403);
+    }
+
+    /// Current value of an error-type counter; tests run in parallel, so only compare for growth.
+    fn errors_recorded(error_type: &str) -> f64 {
+        metrics::GATEWAY_ERRORS_TOTAL
+            .with_label_values(&[error_type])
+            .get()
+    }
+
+    /// Upstream deadline used by the stall tests below.
+    const DEADLINE: Duration = Duration::from_millis(300);
+
+    fn stall_limits() -> Limits {
+        Limits {
+            upstream_timeout: DEADLINE,
+            ..Default::default()
+        }
+    }
+
+    /// A raw JSON-RPC POST for `method`.
+    fn rpc_request(method: &str) -> String {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
+        format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Reads until the gateway closes the connection, failing if it is still open after 3s.
+    async fn read_to_close(conn: &mut TcpStream) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await
+        .expect("gateway hung instead of closing the connection");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// An instant reply would mean the socket broke, not that the deadline fired.
+    fn assert_deadline_fired(elapsed: Duration) {
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected the upstream deadline to fire, got a reply after {elapsed:?}"
+        );
+    }
+
+    /// Spawn a backend that sends headers and 10 of 64 body bytes, then stalls.
+    async fn start_stalled_body_backend() -> SocketAddr {
+        start_partial_body_backend(true).await
+    }
+
+    /// Spawn a backend that sends headers and 10 of 64 body bytes, then stalls if `hold`,
+    /// or closes the connection if not.
+    async fn start_partial_body_backend(hold: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"jsonrpc\"",
+                    )
+                    .await;
+                if hold {
+                    held.push(stream);
+                }
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn redacted_body_read_failure_records_502() {
+        // The node closes mid-body, so collecting the page for redaction fails.
+        let backend = start_partial_body_backend(false).await;
+        let addr = start_auth_gateway(&format!("http://{backend}"), Limits::default()).await;
+        let recorded = |status: &str| {
+            metrics::GATEWAY_REQUESTS_TOTAL
+                .with_label_values(&["getSignatureStatuses", "read", status])
+                .get()
+        };
+        let (ok_before, failed_before) = (recorded("200"), recorded("502"));
+
+        let response = send_raw(addr, rpc_request("getSignatureStatuses").as_bytes()).await;
+
+        assert_status(&response, 502);
+        assert!(recorded("502") > failed_before);
+        assert_eq!(recorded("200"), ok_before);
+    }
+
+    /// Body size large enough to fill every buffer between the gateway and a client that stops reading.
+    const LARGE_BODY: usize = 64 * 1024 * 1024;
+
+    /// Spawn a backend that answers every request with `len` bytes, sent as fast as the gateway takes them.
+    async fn start_large_body_backend(len: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![b'0'; 64 * 1024];
+                    let mut sent = 0;
+                    while sent < len {
+                        let n = chunk.len().min(len - sent);
+                        if stream.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n;
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    /// Connects with a small receive buffer, so the gateway's writes back up quickly.
+    async fn connect_small_window(addr: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.connect(addr).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn client_that_stops_reading_releases_its_slot() {
+        let read_node = start_large_body_backend(LARGE_BODY).await;
+        // One connection slot and one read slot, so a later read proves both were released.
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                max_connections: NonZeroUsize::new(1).unwrap(),
+                max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+                upstream_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Ask for a large body, then never read it.
+        let mut stuck = connect_small_window(addr).await;
+        stuck
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+
+        // Past the deadline the stuck exchange is gone, so an ordinary read is served.
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        next.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), next.read(&mut buf))
+            .await
+            .expect("the read should be served, not left waiting")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+        drop(next);
+
+        // The stuck client's connection was closed by the gateway, not left open.
+        read_to_close(&mut stuck).await;
+    }
+
+    #[tokio::test]
+    async fn slow_steady_reader_within_the_deadline_gets_the_whole_body() {
+        const BODY: usize = 8 * 1024 * 1024;
+        let read_node = start_large_body_backend(BODY).await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                upstream_timeout: Duration::from_secs(20),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // A small window plus pauses keeps the gateway's writes waiting on this client.
+        let mut conn = connect_small_window(addr).await;
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let mut received = Vec::with_capacity(BODY + 1024);
+        let mut buf = vec![0u8; 64 * 1024];
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a steady reader should finish well inside the deadline");
+
+        let head_end = received
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head")
+            + 4;
+        assert_eq!(
+            received.len() - head_end,
+            BODY,
+            "the body must arrive whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_keep_alive_outlives_the_write_deadline() {
+        // Every request arms the write deadline, but it only acts on a response waiting on the client.
+        let addr =
+            start_gateway_with_limits("http://127.0.0.1:1", "http://127.0.0.1:1", stall_limits())
+                .await;
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        conn.write_all(request).await.unwrap();
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+
+        // Idle well past the deadline, then reuse the same connection.
+        tokio::time::sleep(DEADLINE * 3).await;
+        conn.write_all(request).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("the idle connection should still answer")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_headers_return_504() {
+        // Reads stall on the read node, sendTransaction on the write node.
+        for method in ["getSlot", "sendTransaction"] {
+            let stalled = format!("http://{}", start_black_hole_backend().await);
+            let (write_url, read_url) = if method == "sendTransaction" {
+                (stalled.as_str(), "http://127.0.0.1:1")
+            } else {
+                ("http://127.0.0.1:1", stalled.as_str())
+            };
+            let addr = start_gateway_with_limits(write_url, read_url, stall_limits()).await;
+
+            let target = if method == "sendTransaction" {
+                "write"
+            } else {
+                "read"
+            };
+            let recorded = || {
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&[method, target, "504"])
+                    .get()
+            };
+            let timeouts_before = recorded();
+
+            // Two pipelined requests: the 504 must close the connection and drop the second.
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            let start = Instant::now();
+            let req = rpc_request(method);
+            conn.write_all(format!("{req}{req}").as_bytes())
+                .await
+                .unwrap();
+            let response = read_to_close(&mut conn).await;
+
+            assert_status(&response, 504);
+            assert_eq!(
+                response.matches("HTTP/1.1 ").count(),
+                1,
+                "{method}: the pipelined request must not be served: {response}"
+            );
+            assert_deadline_fired(start.elapsed());
+            assert!(recorded() > timeouts_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_streamed_body_aborts_connection() {
+        let backend = start_stalled_body_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{backend}"),
+            stall_limits(),
+        )
+        .await;
+
+        let timeouts_before = errors_recorded(UPSTREAM_TIMEOUT);
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut conn).await;
+        assert!(errors_recorded(UPSTREAM_TIMEOUT) > timeouts_before);
+
+        // Headers were already sent, so the only signal left is a body shorter than declared.
+        assert_status(&response, 200);
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            body.len() < 64,
+            "a stalled body must end short of its Content-Length: {response}"
+        );
+        assert_deadline_fired(start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn stalled_redacted_body_returns_504() {
+        // An anonymous getSignatureStatuses is ungated but redacted, so the body is
+        // collected before anything is sent, and no DB query runs.
+        let backend = start_stalled_body_backend().await;
+        let addr = start_auth_gateway(&format!("http://{backend}"), stall_limits()).await;
+        let recorded = |status: &str| {
+            metrics::GATEWAY_REQUESTS_TOTAL
+                .with_label_values(&["getSignatureStatuses", "read", status])
+                .get()
+        };
+        let (ok_before, timeout_before) = (recorded("200"), recorded("504"));
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(rpc_request("getSignatureStatuses").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut conn).await;
+
+        assert_status(&response, 504);
+        assert_deadline_fired(start.elapsed());
+        // Recorded as the 504 the client got, not the 200 the node's headers carried.
+        assert_eq!(recorded("200"), ok_before);
+        assert!(recorded("504") > timeout_before);
+    }
+
+    #[tokio::test]
+    async fn stalled_read_frees_slot_for_send_transaction() {
+        let read_node = start_black_hole_backend().await;
+        let write_node = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        let addr = start_gateway_with_limits(
+            &format!("http://{write_node}"),
+            &format!("http://{read_node}"),
+            Limits {
+                max_connections: NonZeroUsize::new(1).unwrap(),
+                ..stall_limits()
+            },
+        )
+        .await;
+
+        // A read against the stalled node takes the only slot.
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut stalled).await;
+        assert_status(&response, 504);
+
+        // The gateway closed that connection, so a write gets the slot.
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains("sig123"),
+            "write should reach the healthy node: {response}"
+        );
+    }
+
+    /// One read slot and a deadline long enough to outlast each read-shedding test.
+    fn one_read_slot() -> Limits {
+        Limits {
+            max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+            upstream_timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
+    }
+
+    /// Sends a read that sits on a stalled node, taking the only read slot.
+    async fn hold_read_slot(addr: SocketAddr) -> TcpStream {
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        // Let the gateway take the permit and reach the upstream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        conn
+    }
+
+    #[tokio::test]
+    async fn read_over_capacity_gets_fast_503_and_close() {
+        let read_node = start_black_hole_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            one_read_slot(),
+        )
+        .await;
+        let _held = hold_read_slot(addr).await;
+        let shed_before = metrics::GATEWAY_REJECTED_TOTAL
+            .with_label_values(&[READ_CAPACITY])
+            .get();
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut conn).await;
+
+        // Shed at once and closed, not queued behind the stalled read.
+        assert_status(&response, 503);
+        assert!(
+            metrics::GATEWAY_REJECTED_TOTAL
+                .with_label_values(&[READ_CAPACITY])
+                .get()
+                > shed_before
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "an over-capacity read must be shed at once, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_transaction_succeeds_while_reads_are_shed() {
+        let read_node = start_black_hole_backend().await;
+        let write_node = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        // Two connection slots and one read slot: the shed read must leave a slot for the write.
+        let addr = start_gateway_with_limits(
+            &format!("http://{write_node}"),
+            &format!("http://{read_node}"),
+            Limits {
+                max_connections: NonZeroUsize::new(2).unwrap(),
+                ..one_read_slot()
+            },
+        )
+        .await;
+        let _held = hold_read_slot(addr).await;
+
+        let mut shed = TcpStream::connect(addr).await.unwrap();
+        shed.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut shed).await, 503);
+
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains("sig123"),
+            "write should reach the healthy node: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_read_keeps_its_slot_until_the_body_ends() {
+        let read_node = start_stalled_body_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                upstream_timeout: Duration::from_secs(1),
+                ..one_read_slot()
+            },
+        )
+        .await;
+
+        // The first read has its headers back and is mid-body.
+        let mut streaming = TcpStream::connect(addr).await.unwrap();
+        streaming
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = streaming.read(&mut buf).await.unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+
+        // Its handler has returned, but the streaming body still holds the slot.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut second).await, 503);
+
+        // Once the body ends, the slot is free again.
+        read_to_close(&mut streaming).await;
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        third
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+            .await
+            .expect("a read should be forwarded once the slot is free")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+    }
+
+    /// Serves `access` with every read slot already taken.
+    async fn start_gateway_with_reads_exhausted(
+        write_url: &str,
+        read_url: &str,
+        access: Access,
+    ) -> (SocketAddr, OwnedSemaphorePermit) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let gateway = Arc::new(
+            Gateway::new(
+                write_url.to_string(),
+                read_url.to_string(),
+                "*".to_string(),
+                None,
+                None,
+            )
+            .with_limits(one_read_slot()),
+        );
+        let all_reads = Arc::clone(&gateway.read_slots).try_acquire_owned().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, access).await;
+        });
+        (addr, all_reads)
+    }
+
+    #[tokio::test]
+    async fn writes_never_take_read_slots() {
+        let write_node = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        let (addr, _all_reads) = start_gateway_with_reads_exhausted(
+            &format!("http://{write_node}"),
+            "http://127.0.0.1:1",
+            Access::Public,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn internal_reads_are_not_shed() {
+        // The cap guards public connection slots; operator reads on the internal listener skip it.
+        let read_node = start_mock_http_backend(r#"{"result":7}"#).await;
+        let (addr, _all_reads) = start_gateway_with_reads_exhausted(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Access::Internal,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    /// Serves `access` against `read_url` with every block listing slot already taken.
+    async fn start_gateway_with_block_lists_exhausted(
+        read_url: &str,
+        access: Access,
+    ) -> (SocketAddr, OwnedSemaphorePermit) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let gateway = Arc::new(Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            read_url.to_string(),
+            "*".to_string(),
+            None,
+            None,
+        ));
+        let slots = Arc::clone(&gateway.block_list_slots);
+        let free = slots.available_permits() as u32;
+        let all_block_lists = slots.try_acquire_many_owned(free).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, access).await;
+        });
+        (addr, all_block_lists)
+    }
+
+    #[tokio::test]
+    async fn public_block_list_over_capacity_gets_fast_503_and_close() {
+        for method in BLOCK_LIST_METHODS {
+            let read_node = start_mock_http_backend(r#"{"result":[]}"#).await;
+            let (addr, _all_block_lists) = start_gateway_with_block_lists_exhausted(
+                &format!("http://{read_node}"),
+                Access::Public,
+            )
+            .await;
+            let shed_before = metrics::GATEWAY_REJECTED_TOTAL
+                .with_label_values(&[BLOCK_LIST_CAPACITY])
+                .get();
+
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            conn.write_all(rpc_request(method).as_bytes())
+                .await
+                .unwrap();
+            let response = read_to_close(&mut conn).await;
+
+            assert_status(&response, 503);
+            assert!(
+                metrics::GATEWAY_REJECTED_TOTAL
+                    .with_label_values(&[BLOCK_LIST_CAPACITY])
+                    .get()
+                    > shed_before,
+                "{method} should count as a block listing shed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_block_lists_release_their_slots() {
+        let read_node = start_mock_http_backend(r#"{"result":[]}"#).await;
+        let addr =
+            start_gateway_with_urls("http://127.0.0.1:1", &format!("http://{read_node}")).await;
+
+        // One more call than there are slots: each must hand its slot back once answered.
+        for _ in 0..=Limits::default().max_forwarded_block_lists.get() {
+            let response = send_raw(addr, rpc_request("getBlocks").as_bytes()).await;
+            assert_status(&response, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn other_public_reads_pass_while_block_lists_are_full() {
+        let read_node = start_mock_http_backend(r#"{"result":7}"#).await;
+        let (addr, _all_block_lists) = start_gateway_with_block_lists_exhausted(
+            &format!("http://{read_node}"),
+            Access::Public,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn internal_block_lists_are_not_capped() {
+        let read_node = start_mock_http_backend(r#"{"result":[]}"#).await;
+        let (addr, _all_block_lists) = start_gateway_with_block_lists_exhausted(
+            &format!("http://{read_node}"),
+            Access::Internal,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("getBlocks").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn streamed_block_list_frees_its_global_slot_at_headers() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let read_node = start_stalled_body_backend().await;
+        let gateway = Arc::new(
+            Gateway::new(
+                "http://127.0.0.1:1".to_string(),
+                format!("http://{read_node}"),
+                "*".to_string(),
+                None,
+                None,
+            )
+            .with_limits(Limits {
+                upstream_timeout: Duration::from_secs(1),
+                ..Default::default()
+            }),
+        );
+        let slots = Arc::clone(&gateway.block_list_slots);
+        let all = slots.available_permits();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, Access::Public).await;
+        });
+
+        // The listing has its headers back and its body never finishes.
+        let mut streaming = TcpStream::connect(addr).await.unwrap();
+        streaming
+            .write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = streaming.read(&mut buf).await.unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+
+        // The node is done with the database by then, so an unread body holds no global slot.
+        assert_eq!(slots.available_permits(), all);
+    }
+
+    #[tokio::test]
+    async fn one_client_cannot_take_every_block_list_slot() {
+        let read_node = start_stalled_body_backend().await;
+        let limits = Limits {
+            upstream_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let per_client = limits.block_lists_per_ip();
+        assert!(per_client < limits.max_forwarded_block_lists.get());
+        let addr =
+            start_gateway_with_limits("http://127.0.0.1:1", &format!("http://{read_node}"), limits)
+                .await;
+
+        // This client fills its own share with listings that never finish streaming.
+        let mut buf = [0u8; 1024];
+        let mut streaming = Vec::new();
+        for _ in 0..per_client {
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            conn.write_all(rpc_request("getBlocks").as_bytes())
+                .await
+                .unwrap();
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+            streaming.push(conn);
+        }
+
+        // Global slots are still free, but this client gets no more of them.
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        over.write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut over).await, 503);
+
+        // Once its listings end, its share is free again.
+        for mut conn in streaming {
+            read_to_close(&mut conn).await;
+        }
+        let mut again = TcpStream::connect(addr).await.unwrap();
+        again
+            .write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), again.read(&mut buf))
+            .await
+            .expect("a listing should be forwarded once the client's share is free")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+    }
+
+    #[test]
+    fn read_pool_size_is_resolved_like_the_read_node() {
+        for (raw, pool) in [
+            (None, 32),
+            (Some(""), 32),
+            (Some("abc"), 32),
+            (Some("0"), 32),
+            (Some("64"), 64),
+            (Some("256"), 256),
+            (Some("300"), 256),
+        ] {
+            assert_eq!(resolve_read_pool_size(raw), pool, "raw {raw:?}");
+        }
+    }
+
+    #[test]
+    fn gateway_block_list_slots_scale_with_pool() {
+        for (pool, slots) in [(1, 1), (7, 1), (8, 2), (32, 8), (256, 64)] {
+            assert_eq!(Limits::block_list_slots(pool).get(), slots, "pool {pool}");
+        }
+    }
+
+    #[test]
+    fn forwarded_read_limit_must_stay_below_max_connections() {
+        let limits = |reads, connections| Limits {
+            max_forwarded_reads: NonZeroUsize::new(reads).unwrap(),
+            max_connections: NonZeroUsize::new(connections).unwrap(),
+            ..Default::default()
+        };
+        assert!(check_limits(&Limits::default()).is_ok());
+        assert!(check_limits(&limits(1023, 1024)).is_ok());
+        assert!(check_limits(&limits(1024, 1024)).is_err());
+        assert!(check_limits(&limits(2000, 1024)).is_err());
+    }
+
+    #[test]
+    fn upstream_timeout_flag_is_bounded() {
+        let parse = |secs: &str| {
+            Args::try_parse_from([
+                "gateway",
+                "--write-url",
+                "http://w",
+                "--read-url",
+                "http://r",
+                "--upstream-timeout-secs",
+                secs,
+            ])
+        };
+        // Zero fails every request, and a huge value overflows the deadline math.
+        assert!(parse("0").is_err());
+        assert!(parse("3601").is_err());
+        assert_eq!(parse("3600").unwrap().upstream_timeout_secs, 3600);
+    }
+
+    /// Body that never yields, like an upstream that stopped sending.
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Poll::Pending
+        }
+    }
+
+    fn full_body(
+        data: &'static str,
+    ) -> http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError> {
+        Full::new(Bytes::from(data))
+            .map_err(|never| match never {})
+            .boxed_unsync()
+    }
+
+    #[tokio::test]
+    async fn deadline_body_passes_frames_and_framing() {
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        // A known length must survive the wrapper, or hyper would switch to chunked.
+        let body = DeadlineBody::new(full_body("abc"), far, None);
+        assert_eq!(body.size_hint().exact(), Some(3));
+        assert!(!body.is_end_stream());
+        assert_eq!(&body.collect().await.unwrap().to_bytes()[..], b"abc");
+
+        let empty = DeadlineBody::new(
+            Empty::new().map_err(|never| match never {}).boxed_unsync(),
+            far,
+            None,
+        );
+        assert!(empty.is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn deadline_body_errors_once_deadline_passes() {
+        let start = Instant::now();
+        let mut body = DeadlineBody::new(
+            PendingBody.boxed_unsync(),
+            tokio::time::Instant::now() + Duration::from_millis(200),
+            None,
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("the deadline should end a stalled body");
+        assert!(
+            matches!(frame, Some(Err(_))),
+            "a stalled body must error, not end cleanly"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    /// Body with a frame ready on every poll, like an upstream that dribbles forever.
+    struct EndlessBody;
+
+    impl Body for EndlessBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_deadline_closes_a_connection_whose_client_stopped_reading() {
+        // A small pipe the client never reads, and a body that always has data, so hyper's
+        // write buffer fills and it stops polling the body.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let deadline: WriteDeadline = Arc::new(Mutex::new(Some(
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        )));
+        let service = service_fn(|_req| async {
+            Ok::<_, std::convert::Infallible>(Response::new(EndlessBody))
+        });
+        let conn = http1::Builder::new()
+            .serve_connection(TokioIo::new(DeadlineIo::new(server, deadline)), service);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let start = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(2), conn)
+            .await
+            .expect("the connection should end once the write deadline passes");
+        assert!(result.is_err(), "a stuck write must fail the connection");
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[tokio::test]
+    async fn deadline_body_errors_when_frames_keep_arriving() {
+        let start = Instant::now();
+        let mut body = DeadlineBody::new(
+            EndlessBody.boxed_unsync(),
+            tokio::time::Instant::now() + Duration::from_millis(200),
+            None,
+        );
+
+        // Frames never stop, so only the deadline can end this loop.
+        loop {
+            match body.frame().await {
+                Some(Ok(_)) => assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "frames kept flowing past the deadline"
+                ),
+                Some(Err(_)) => break,
+                None => panic!("an endless body must not end cleanly"),
+            }
+        }
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    fn parse_args(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "gateway",
+            "--write-url",
+            "http://w",
+            "--read-url",
+            "http://r",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("test args must parse")
+    }
+
+    /// An address nothing listens on, so a run that gets past validation fails to connect.
+    const UNREACHABLE_AUTH_DB: &str = "postgres://127.0.0.1:1/auth";
+
+    #[test]
+    fn per_ip_cap_must_stay_below_max_connections() {
+        let limits = |per_ip, connections| Limits {
+            max_connections_per_ip: NonZeroUsize::new(per_ip).unwrap(),
+            max_connections: NonZeroUsize::new(connections).unwrap(),
+            max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        };
+        assert!(check_limits(&limits(63, 64)).is_ok());
+        for (per_ip, connections) in [(64, 64), (65, 64)] {
+            let err = check_limits(&limits(per_ip, connections))
+                .expect_err("a per-IP cap that is not below the global cap must be refused");
+            assert!(err.contains("GATEWAY_MAX_CONNECTIONS_PER_IP"), "got: {err}");
+            assert!(err.contains("must be below"), "got: {err}");
+        }
+    }
+
+    /// The same vectors are pinned in the auth service's config tests.
+    #[test]
+    fn jwt_secret_rule_matches_the_auth_service() {
+        let thirty_one = "a".repeat(31);
+        let thirty_two = "a".repeat(32);
+        for off in [None, Some("")] {
+            assert_eq!(resolve_jwt_secret(off), Ok(None), "blank means RBAC off");
+        }
+        for bad in [
+            "   \t\n".to_string(),
+            "secret".to_string(),
+            thirty_one.clone(),
+            format!("{thirty_one}\n"),
+            format!("  {thirty_one}  "),
+        ] {
+            let err = resolve_jwt_secret(Some(&bad)).expect_err("must be rejected");
+            assert!(err.contains("JWT_SECRET"), "got: {err}");
+        }
+        for good in [thirty_two.clone(), format!(" {thirty_two}\n")] {
+            assert_eq!(resolve_jwt_secret(Some(&good)), Ok(Some(good.as_str())));
+        }
+    }
+
+    #[test]
+    fn a_rejected_jwt_secret_is_never_echoed() {
+        let marker = "LEAKMARKER-xyz";
+        let err = resolve_jwt_secret(Some(marker)).expect_err("short secret");
+        assert!(
+            !err.contains(marker) && !err.contains("LEAK"),
+            "leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_auth_pool_size_is_rejected_by_the_parser() {
+        let parsed = Args::try_parse_from([
+            "gateway",
+            "--write-url",
+            "http://w",
+            "--read-url",
+            "http://r",
+            "--auth-database-max-connections",
+            "0",
+        ]);
+        assert!(parsed.is_err(), "a zero pool panics in sqlx pool creation");
+    }
+
+    /// `run` must refuse a bad secret before it builds the pool, so the error is the
+    /// validation message and not a connection failure to the unreachable database.
+    #[tokio::test]
+    async fn run_refuses_a_weak_or_whitespace_secret_before_connecting() {
+        let marker = "LEAKMARKER-xyz";
+        for secret in [marker, "   ", "short-secret"] {
+            let args = parse_args(&[
+                "--port",
+                "0",
+                "--jwt-secret",
+                secret,
+                "--auth-database-url",
+                UNREACHABLE_AUTH_DB,
+            ]);
+            let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+                .await
+                .expect("a bad secret must be refused, not served")
+                .expect_err("a bad secret must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("JWT_SECRET"), "got: {msg}");
+            assert!(!msg.contains(marker), "secret leaked: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_refuses_equal_connection_caps_before_connecting() {
+        let args = parse_args(&[
+            "--port",
+            "0",
+            "--jwt-secret",
+            "",
+            "--auth-database-url",
+            UNREACHABLE_AUTH_DB,
+            "--max-connections",
+            "100",
+            "--max-connections-per-ip",
+            "100",
+            "--max-forwarded-reads",
+            "50",
+        ]);
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("bad limits must be refused, not served")
+            .expect_err("bad limits must be refused");
+        assert!(
+            err.to_string().contains("GATEWAY_MAX_CONNECTIONS_PER_IP"),
+            "got: {err}"
+        );
+    }
+
+    /// An origin that is not a valid header value would panic every response, so `run`
+    /// must refuse it before connecting or binding.
+    #[tokio::test]
+    async fn run_refuses_an_invalid_cors_origin_before_connecting() {
+        let args = parse_args(&[
+            "--port",
+            "0",
+            "--jwt-secret",
+            "",
+            "--auth-database-url",
+            UNREACHABLE_AUTH_DB,
+            "--cors-allowed-origin",
+            "https://app.example.com\r\nX-Injected: 1",
+        ]);
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("a bad origin must be refused, not served")
+            .expect_err("a bad origin must be refused");
+        assert!(
+            err.to_string().contains("GATEWAY_CORS_ALLOWED_ORIGIN"),
+            "got: {err}"
+        );
+    }
+
+    /// A strong secret passes the strength rule and reaches the next check, which wants
+    /// the auth database next to it.
+    #[tokio::test]
+    async fn run_accepts_a_strong_secret_and_moves_on_to_the_database_check() {
+        let strong = "0123456789abcdef0123456789abcdef01234567";
+        let mut args = parse_args(&["--port", "0", "--jwt-secret", strong]);
+        // The flag also reads AUTH_DATABASE_URL from the environment.
+        args.auth_database_url = None;
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("a missing auth database must be refused, not served")
+            .expect_err("a secret without an auth database is refused");
+        assert!(
+            err.to_string()
+                .contains("AUTH_DATABASE_URL is not configured"),
+            "got: {err}"
+        );
+    }
+
+    /// Blank means RBAC off, so the gateway keeps serving.
+    #[tokio::test]
+    async fn run_serves_with_a_blank_secret() {
+        let mut args = parse_args(&["--port", "0", "--jwt-secret", ""]);
+        args.auth_database_url = None;
+        let outcome = tokio::time::timeout(Duration::from_millis(500), run(args)).await;
+        assert!(
+            outcome.is_err(),
+            "a blank secret must leave the gateway serving"
+        );
     }
 }

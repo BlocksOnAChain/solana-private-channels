@@ -1,22 +1,36 @@
 //! Integration tests for the reconciliation storage queries.
 //!
 //! Covers the ledger balance aggregate shared by startup and runtime
-//! reconciliation, the durable halt flag and the in-flight envelope.
+//! reconciliation, the manual reconcile command run against it, the durable halt
+//! flag and the in-flight envelope.
 //!
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bigdecimal::BigDecimal;
+use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{
+    error::{IndexerError, ReconciliationError, StorageError},
+    indexer::reconciliation::run_manual_reconciliation,
     storage::{
-        common::{amount::TokenAmount, models::DbObservedRelease},
+        common::{
+            amount::TokenAmount, models::DbObservedRelease, storage::live_lock::LiveLockMode,
+        },
         PostgresDb, Storage,
     },
-    PostgresConfig,
+    PostgresConfig, ReconciliationConfig,
 };
 use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use spl_token::{
+    solana_program::{program_option::COption, program_pack::Pack},
+    state::Mint,
+};
 use sqlx::PgPool;
+use std::{sync::Arc, time::Duration};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+use tokio_util::sync::CancellationToken;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -60,8 +74,8 @@ async fn insert_mint(
     token_program: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, created_at)
-         VALUES ($1, $2, $3, NOW())",
+        "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee, created_at)
+         VALUES ($1, $2, $3, 1, NOW())",
     )
     .bind(mint_address)
     .bind(decimals)
@@ -191,6 +205,128 @@ async fn unpinned_withdrawals_at(
         .find(|r| r.mint_address == mint)
         .ok_or("mint missing from the aggregate")?;
     Ok(row.total_withdrawals)
+}
+
+/// Serve the RPC reads a reconcile makes for one allowed `mint`, all at `slot`: the
+/// instance ATA holding `custody`, and a channel supply equal to it so only the ledger
+/// comparison can fail.
+async fn mock_escrow_rpc(
+    instance: &Pubkey,
+    mint: &Pubkey,
+    custody: u64,
+    slot: u64,
+) -> mockito::ServerGuard {
+    let mut server = mockito::Server::new_async().await;
+
+    let ata = get_associated_token_address_with_program_id(instance, mint, &spl_token::id());
+    let token_sweep = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": slot},
+            "value": [{
+                "pubkey": ata.to_string(),
+                "account": {
+                    "lamports": 2_039_280u64,
+                    "owner": spl_token::id().to_string(),
+                    "executable": false,
+                    "rentEpoch": 0,
+                    "space": 165,
+                    "data": {
+                        "program": "spl-token",
+                        "space": 165,
+                        "parsed": {
+                            "type": "account",
+                            "info": {
+                                "mint": mint.to_string(),
+                                "owner": instance.to_string(),
+                                "tokenAmount": {
+                                    "amount": custody.to_string(),
+                                    "decimals": 6,
+                                    "uiAmount": null,
+                                    "uiAmountString": custody.to_string()
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+        .with_body(token_sweep.to_string())
+        .create_async()
+        .await;
+
+    let empty_sweep = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"context": {"slot": slot}, "value": []}
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+        .with_body(empty_sweep.to_string())
+        .create_async()
+        .await;
+
+    // The sweep only checks that the mint's AllowedMint PDA is escrow-owned.
+    let allowed_mint_pda = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": slot},
+            "value": [{
+                "lamports": 1_000_000u64,
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "data": ["", "base64"]
+            }]
+        }
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"method": "getMultipleAccounts"}),
+        ))
+        .with_body(allowed_mint_pda.to_string())
+        .create_async()
+        .await;
+
+    let mut mint_data = vec![0u8; Mint::LEN];
+    Mint {
+        mint_authority: COption::Some(Pubkey::new_unique()),
+        supply: custody,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    }
+    .pack_into_slice(&mut mint_data);
+    let channel_mint = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": slot},
+            "value": {
+                "lamports": 1_000_000u64,
+                "owner": spl_token::id().to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "data": [STANDARD.encode(&mint_data), "base64"]
+            }
+        }
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex("getAccountInfo".to_string()))
+        .with_body(channel_mint.to_string())
+        .create_async()
+        .await;
+
+    server
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -619,6 +755,129 @@ async fn release_counts_at_the_bound_not_above() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Custody moves when a deposit lands and when a release lands, not when the operator
+/// finishes either. A manual reconcile must count a stuck deposit as backing custody and a
+/// release whose row trails as having left it.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_reconciliation_counts_a_stuck_deposit_and_a_trailing_release(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let instance = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let mint_address = mint.to_string();
+    let deposit = 100;
+    let release = 50;
+    let custody_slot = 100;
+    insert_mint(&pool, &mint_address, 6, &spl_token::id().to_string()).await?;
+    insert_transaction(
+        &pool,
+        "d_done",
+        &mint_address,
+        deposit,
+        "deposit",
+        "completed",
+        50,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "d_stuck",
+        &mint_address,
+        deposit,
+        "deposit",
+        "manual_review",
+        50,
+    )
+    .await?;
+    let nonce = insert_withdrawal(
+        &pool,
+        "w_trailing",
+        &mint_address,
+        release,
+        "processing",
+        60,
+    )
+    .await?;
+    observe_release(&storage, nonce, 70).await?;
+    storage
+        .update_committed_checkpoint("escrow", custody_slot)
+        .await?;
+    let storage = Arc::new(storage);
+    let config = ReconciliationConfig::default();
+
+    // Both deposits back custody and the release has left it, so 150 passes only if the
+    // processing row's release was subtracted.
+    let healthy = mock_escrow_rpc(&instance, &mint, 2 * deposit - release, custody_slot).await;
+    run_manual_reconciliation(
+        &config,
+        &storage,
+        &healthy.url(),
+        Some(&healthy.url()),
+        &instance,
+    )
+    .await?;
+
+    // One deposit is what counting completed rows alone expects, so the deleted script
+    // passed it. The stuck deposit makes it a shortfall.
+    let drained = mock_escrow_rpc(&instance, &mint, deposit, custody_slot).await;
+    let result = run_manual_reconciliation(
+        &config,
+        &storage,
+        &drained.url(),
+        Some(&drained.url()),
+        &instance,
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::MismatchExceedsThreshold { count: 1, .. }
+            ))
+        ),
+        "custody short of the stuck deposit must be reported: {result:?}"
+    );
+    Ok(())
+}
+
+/// A resync deletes the ledger it rebuilds, so a manual run must not compare while one
+/// holds the live-state lock: rows deleted mid-run would read as smaller liabilities.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_reconciliation_is_refused_during_a_resync() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+    // Held as a resync holds it.
+    let _resync_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Exclusive,
+            "reconcile_test_resync",
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await?;
+    // Nothing listens here, so a run that gets past the lock fails on the custody read.
+    let unreachable_rpc = "http://127.0.0.1:1";
+
+    let result = run_manual_reconciliation(
+        &ReconciliationConfig::default(),
+        &Arc::new(storage),
+        unreachable_rpc,
+        Some(unreachable_rpc),
+        &Pubkey::new_unique(),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockHeld {
+                requested: LiveLockMode::Shared
+            }))
+        ),
+        "a run must be refused while a resync holds the lock: {result:?}"
+    );
+    Ok(())
+}
+
 /// Withdrawal rows carry a channel slot, so a row far above the Solana bound still
 /// subtracts once its release is observed below it.
 #[tokio::test(flavor = "multi_thread")]
@@ -835,8 +1094,12 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
     // mint_b: a single pending 250.
     insert_transaction(&pool, "b_pend", &mint_b, 250, "deposit", "pending", 7).await?;
 
-    let mut rows = storage.get_in_flight_amounts_by_mint().await?;
+    let mut rows = storage.get_in_flight_amounts_by_mint(None, None).await?;
     rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
+    assert!(
+        rows.iter().all(|r| r.adjustment_amount == 0u64),
+        "no bounds, no adjustment"
+    );
 
     let mut by_mint: std::collections::HashMap<String, BigDecimal> = rows
         .into_iter()
@@ -846,5 +1109,136 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
     assert_eq!(by_mint.remove(&mint_b), Some(BigDecimal::from(250u64)));
     assert!(by_mint.is_empty(), "no unexpected mints in the envelope");
 
+    Ok(())
+}
+
+/// (in_flight, adjustment) for `mint` under the given bounds.
+async fn envelope_parts(
+    storage: &Storage,
+    mint: &str,
+    deposits_after: Option<u64>,
+    withdrawals_after: Option<u64>,
+) -> Result<(BigDecimal, BigDecimal), Box<dyn std::error::Error>> {
+    let rows = storage
+        .get_in_flight_amounts_by_mint(deposits_after, withdrawals_after)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .find(|r| r.mint_address == mint)
+        .map(|r| (r.in_flight_amount, r.adjustment_amount))
+        .unwrap_or_default())
+}
+
+/// A settled row counts only strictly above its own type's bound: `slot = bound` is excluded,
+/// `bound + 1` included, and a deposit is never judged against the withdrawal bound or back.
+#[tokio::test(flavor = "multi_thread")]
+async fn envelope_adjustment_boundary_per_type() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+
+    insert_transaction(&pool, "d_at", &mint, 1, "deposit", "completed", 1_000).await?;
+    insert_transaction(&pool, "d_above", &mint, 2, "deposit", "completed", 1_001).await?;
+    insert_transaction(&pool, "w_at", &mint, 4, "withdrawal", "completed", 10).await?;
+    insert_transaction(&pool, "w_above", &mint, 8, "withdrawal", "completed", 11).await?;
+    // Between the two bounds: above the withdrawal bound only.
+    insert_transaction(&pool, "d_mid", &mint, 16, "deposit", "completed", 500).await?;
+    insert_transaction(&pool, "w_mid", &mint, 32, "withdrawal", "completed", 500).await?;
+
+    let (in_flight, adjustment) = envelope_parts(&storage, &mint, Some(1_000), Some(10)).await?;
+    assert_eq!(in_flight, BigDecimal::from(0u64));
+    assert_eq!(adjustment, BigDecimal::from(2u64 + 8 + 32));
+
+    // One arm at a time.
+    let (_, deposits) = envelope_parts(&storage, &mint, Some(1_000), None).await?;
+    assert_eq!(deposits, BigDecimal::from(2u64));
+    let (_, withdrawals) = envelope_parts(&storage, &mint, None, Some(10)).await?;
+    assert_eq!(withdrawals, BigDecimal::from(8u64 + 32));
+
+    // u64::MAX clamps to i64::MAX and matches nothing rather than wrapping negative.
+    let (_, none) = envelope_parts(&storage, &mint, Some(u64::MAX), Some(u64::MAX)).await?;
+    assert_eq!(none, BigDecimal::from(0u64));
+    Ok(())
+}
+
+/// The same rows and bounds as the Mock storage test give the same sums.
+#[tokio::test(flavor = "multi_thread")]
+async fn envelope_adjustment_matches_the_mock() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+
+    insert_transaction(&pool, "r1", &mint, 1, "deposit", "completed", 1_000).await?;
+    insert_transaction(&pool, "r2", &mint, 2, "deposit", "completed", 1_001).await?;
+    insert_transaction(&pool, "r3", &mint, 4, "deposit", "failed", 1_002).await?;
+    insert_transaction(&pool, "r4", &mint, 8, "withdrawal", "completed", 10).await?;
+    insert_transaction(&pool, "r5", &mint, 16, "withdrawal", "manual_review", 11).await?;
+    insert_transaction(&pool, "r6", &mint, 32, "withdrawal", "completed", 5_000).await?;
+    insert_transaction(&pool, "r7", &mint, 64, "deposit", "processing", 2_000).await?;
+
+    let parts = envelope_parts(&storage, &mint, Some(1_000), Some(10)).await?;
+    assert_eq!(
+        parts,
+        (
+            BigDecimal::from(64u64),
+            BigDecimal::from(2u64 + 4 + 16 + 32)
+        )
+    );
+    let (_, adjustment) = envelope_parts(&storage, &mint, Some(1_000), Some(5_000)).await?;
+    assert_eq!(adjustment, BigDecimal::from(2u64 + 4));
+    Ok(())
+}
+
+/// Every status is either in the envelope or counted by its slot arm, never both; a new
+/// status must be classified here before this compiles.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_status_is_counted_exactly_once_above_the_bound(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::models::TransactionStatus::{self, *};
+    fn in_envelope(status: TransactionStatus) -> bool {
+        match status {
+            Pending | Processing | Parked | PendingRemint => true,
+            Completed | Failed | FailedReminted | ManualReview => false,
+        }
+    }
+    let all = [
+        (Pending, "pending"),
+        (Processing, "processing"),
+        (Parked, "parked"),
+        (PendingRemint, "pending_remint"),
+        (Completed, "completed"),
+        (Failed, "failed"),
+        (FailedReminted, "failed_reminted"),
+        (ManualReview, "manual_review"),
+    ];
+    let (pool, storage, _pg) = start_postgres().await?;
+    for (status, label) in all {
+        for kind in ["deposit", "withdrawal"] {
+            let mint = Pubkey::new_unique().to_string();
+            let sig = format!("{label}_{kind}");
+            insert_transaction(&pool, &sig, &mint, 7, kind, label, 50).await?;
+            let parts = envelope_parts(&storage, &mint, Some(10), Some(10)).await?;
+            let (seven, zero) = (BigDecimal::from(7u64), BigDecimal::from(0u64));
+            let expected = if in_envelope(status) {
+                (seven, zero)
+            } else {
+                (zero, seven)
+            };
+            assert_eq!(parts, expected, "{label} {kind}");
+        }
+    }
+    Ok(())
+}
+
+/// Schema init runs at every boot, so the withdrawal slot index must survive a second run.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_slot_index_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage.init_schema().await?;
+    let def: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_transactions_withdrawal_slot'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(def.contains("(slot)"), "{def}");
+    assert!(def.contains("'withdrawal'"), "{def}");
     Ok(())
 }

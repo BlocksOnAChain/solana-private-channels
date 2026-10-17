@@ -51,6 +51,10 @@ use spl_transfer_hook_interface::{
     get_extra_account_metas_address, instruction::ExecuteInstruction,
 };
 use std::time::Duration;
+use test_utils::channel_shim::ChannelShim;
+use test_utils::mint_helper::{
+    TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+};
 use test_utils::operator_helper::start_private_channel_to_solana_operator;
 use test_utils::validator_helper::{start_test_validator_no_geyser, HOOK_FIXTURE_PROGRAM_ID};
 use testcontainers::runners::AsyncRunner;
@@ -223,6 +227,9 @@ async fn allow_mint_2022(
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
         .instruction();
 
     let recent_blockhash = client.get_latest_blockhash().await?;
@@ -366,6 +373,7 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
         mint_pubkey.to_string(),
         6,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
@@ -374,6 +382,9 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_pubkey}"),
             created_at: Utc::now(),
         }])
@@ -422,9 +433,11 @@ async fn test_withdrawal_of_transfer_hook_mint_releases() -> Result<(), Box<dyn 
         ))
         .await?;
 
+    // The validator has no status snapshot, so the operator reads the channel through this.
+    let channel_shim = ChannelShim::start(&env.test_validator.rpc_url()).await;
     let operator_handle = start_private_channel_to_solana_operator(
         env.test_validator.rpc_url(),
-        env.test_validator.rpc_url(),
+        channel_shim.url(),
         env.db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         env.instance_pda,
@@ -475,9 +488,11 @@ async fn test_withdrawal_parks_when_validation_account_is_missing(
         ))
         .await?;
 
+    // The validator has no status snapshot, so the operator reads the channel through this.
+    let channel_shim = ChannelShim::start(&env.test_validator.rpc_url()).await;
     let operator_handle = start_private_channel_to_solana_operator(
         env.test_validator.rpc_url(),
-        env.test_validator.rpc_url(),
+        channel_shim.url(),
         env.db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         env.instance_pda,

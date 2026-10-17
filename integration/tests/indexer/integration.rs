@@ -26,7 +26,9 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signature::Signer;
 use solana_sdk::signer::SeedDerivable;
 use std::sync::{Arc, Once};
+use test_utils::channel_shim::ChannelShim;
 use test_utils::indexer_helper::{start_private_channel_indexer, start_solana_indexer};
+use test_utils::mint_helper::TEST_WITHDRAW_FEE;
 use test_utils::operator_helper::{
     start_private_channel_to_solana_operator, start_solana_to_private_channel_operator,
 };
@@ -572,18 +574,21 @@ async fn verify_final_balances(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nVerifying final balances after complete round-trip...");
 
+    // One validator plays both chains, so the burn and the release net out and
+    // only the fee of each user's one withdrawal is gone, paid to the admin.
+    let expected_balance = initial_balance - TEST_WITHDRAW_FEE;
     for (user_id, user) in env.users.iter().enumerate() {
         let actual_balance = get_token_balance(client.as_ref(), &user.pubkey(), &env.mint).await?;
 
         assert_eq!(
-            actual_balance, initial_balance,
+            actual_balance, expected_balance,
             "User {} final balance mismatch after round-trip. Expected: {}, Actual: {}",
-            user_id, initial_balance, actual_balance
+            user_id, expected_balance, actual_balance
         );
     }
 
     println!(
-        "✓ All {} users returned to original balance after full round-trip",
+        "✓ All {} users back to their original balance less one withdraw fee",
         NUM_USERS
     );
 
@@ -895,8 +900,10 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     let operator_key = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).unwrap();
     println!("\n=== Starting Solana -> PrivateChannel Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    // The validator plays the channel but has no status snapshot, so the shim serves it.
+    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let _solana_to_private_channel_operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        channel_shim.url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,
@@ -909,7 +916,7 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     let _private_channel_to_solana_operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
-        test_validator.rpc_url(),
+        channel_shim.url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,

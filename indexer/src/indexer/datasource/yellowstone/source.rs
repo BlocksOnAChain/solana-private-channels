@@ -23,10 +23,9 @@ use crate::indexer::datasource::common::parser::escrow::parse_escrow_instruction
 use crate::indexer::datasource::common::parser::withdraw::parse_withdraw_instruction;
 use crate::indexer::datasource::common::tx_validation::{
     check_inner_set_index, check_instruction, check_loaded_counts, check_signature,
+    targets_configured_instance,
 };
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
-use crate::indexer::datasource::rpc_polling::decoder::targets_configured_instance;
-use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
 use crate::storage::Storage;
 
 #[cfg(feature = "datasource-rpc")]
@@ -62,8 +61,7 @@ pub struct YellowstoneSource {
     #[cfg(feature = "datasource-rpc")]
     startup_floor: Option<u64>,
     health: Option<Arc<private_channel_metrics::HealthState>>,
-    /// Silent-stream watchdog window. Defaults to STREAM_STALL_TIMEOUT; overridable
-    /// (mainly so tests can drive the reconnect path without a 120s wait).
+    /// How long the stream may go without chain progress; overridable so tests need not wait 120s.
     stall_timeout: std::time::Duration,
 }
 
@@ -103,7 +101,7 @@ impl YellowstoneSource {
         self
     }
 
-    /// Override the silent-stream watchdog window (mainly for tests).
+    /// Override the no-progress window (mainly for tests); a value near Duration::MAX panics.
     pub fn with_stall_timeout(mut self, stall_timeout: std::time::Duration) -> Self {
         self.stall_timeout = stall_timeout;
         self
@@ -148,19 +146,49 @@ const RECONNECT_GAP_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// HTTP/2 keepalive interval: send a PING to the peer this often so a dead transport
 /// surfaces as a stream error instead of hanging. Paired with keep_alive_while_idle so
-/// pings fire even when no blocks stream (escrow blocks are sparse on quiet clusters).
+/// pings fire between updates. Blocks always stream; only their transaction lists are sparse.
 const GRPC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Tear the connection down if a keepalive PING goes unanswered this long.
 const GRPC_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Application-level watchdog: force a reconnect if no message of ANY kind (a block or
-/// a server ping) arrives within this window. Backstops the h2 keepalive for a server
-/// that keeps the socket up but wedges mid-stream. When escrow is idle, server pings are
-/// the only regular signal, so this sits well above any reasonable ping cadence to avoid
-/// tearing down a healthy but quiet stream. If idle false-reconnects ever show up in the
-/// reconnect metric, subscribe to slots for a per-slot heartbeat instead of widening this.
+/// How far a finalized Slot may run past the last delivered block before the blocks in between
+/// count as withheld. The pinned plugin sends each Block before its Slot, so this is only slack
+/// for other providers, and small enough that RPC refills them faster than refunds re-check.
+const WITHHELD_BLOCK_SLOTS: u64 = 32;
+
+/// Reconnect when no new Slot or Block arrives in this window; pings alone do not count.
 const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Stall deadline that only chain progress restarts. A Slot or Block above the highest slot
+/// seen on this connection restarts it; any other Slot or Block only gives back the time spent
+/// handling it, so a slow processor is never mistaken for a silent stream. Pings never move it.
+struct ProgressWatchdog {
+    window: std::time::Duration,
+    highest: Option<u64>,
+    deadline: tokio::time::Instant,
+}
+
+impl ProgressWatchdog {
+    fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            highest: None,
+            deadline: tokio::time::Instant::now() + window,
+        }
+    }
+
+    /// Call once a Slot or Block for `slot`, received at `arrived`, has been fully handled.
+    fn handled(&mut self, slot: u64, arrived: tokio::time::Instant) {
+        let now = tokio::time::Instant::now();
+        if self.highest.is_none_or(|highest| slot > highest) {
+            self.highest = Some(slot);
+            self.deadline = now + self.window;
+        } else {
+            self.deadline += now - arrived;
+        }
+    }
+}
 
 /// Terminal states of the reconnect gap repair; there is no error variant because
 /// failures retry inside the loop instead of falling through to a resubscribe.
@@ -682,6 +710,7 @@ async fn connect_and_stream(
     // Highest slot the gap-fill covers, and the last block forwarded; both reset per connection.
     let mut gate_target: Option<u64> = None;
     let mut last_forwarded: Option<ForwardedBlock> = None;
+    let mut progress = ProgressWatchdog::new(stall_timeout);
 
     loop {
         tokio::select! {
@@ -692,23 +721,22 @@ async fn connect_and_stream(
                 info!("Yellowstone gRPC connection closed");
                 break;
             }
-            // Fresh timer each iteration, so any inbound message resets it. Fires only
-            // when the stream goes fully silent; returns Err to take the reconnect +
-            // gap-fill path (which replays whatever slots were missed while wedged).
-            _ = tokio::time::sleep(stall_timeout) => {
+            // No chain progress in the window: Err takes the reconnect and gap-fill path.
+            _ = tokio::time::sleep_until(progress.deadline) => {
                 warn!(
-                    "Yellowstone stream stalled: no message in {:?}, forcing reconnect",
+                    "Yellowstone stream stalled: no chain progress in {:?}, forcing reconnect",
                     stall_timeout
                 );
                 metrics::INDEXER_RPC_ERRORS
                     .with_label_values(&[program_type.as_label(), "stall"])
                     .inc();
                 return Err(DataSourceRpcError::Protocol {
-                    reason: format!("stream stalled: no message in {stall_timeout:?}"),
+                    reason: format!("stream stalled: no chain progress in {stall_timeout:?}"),
                 }
                 .into());
             }
             message = stream.next() => {
+                let arrived = tokio::time::Instant::now();
                 match message {
                     None => break,
                     Some(message) => match message {
@@ -738,8 +766,56 @@ async fn connect_and_stream(
                             gate_target = Some(target);
                         }
                     }
+                    // Blocks withheld behind a Slot are filled over RPC, or the checkpoint freezes.
+                    let covered = last_forwarded.as_ref().map(|b| b.slot).max(gate_target);
+                    // Re-arming aborts the running fill, so a slow fill finishes and the next Slot extends it.
+                    #[cfg(feature = "datasource-rpc")]
+                    let filling = backfill_handle.as_ref().is_some_and(|h| !h.is_finished());
                     #[cfg(not(feature = "datasource-rpc"))]
-                    let _ = slot_update;
+                    let filling = false;
+                    if let Some(covered) = covered
+                        .filter(|c| !filling && slot_update.slot > c + WITHHELD_BLOCK_SLOTS)
+                    {
+                        metrics::INDEXER_RPC_ERRORS
+                            .with_label_values(&[program_type.as_label(), "chain_break_stream"])
+                            .inc();
+                        #[cfg(feature = "datasource-rpc")]
+                        let rearmed = match gap_ctx {
+                            Some(ctx) => {
+                                warn!(
+                                    "Yellowstone slot {} arrived without the blocks after slot {covered}; filling them over RPC",
+                                    slot_update.slot
+                                );
+                                let armed_target = arm_reconnect_gap(
+                                    slot_update.slot,
+                                    startup_floor,
+                                    ctx,
+                                    &tx,
+                                    &cancellation_token,
+                                    RECONNECT_GAP_RETRY_BACKOFF,
+                                    backfill_handle,
+                                )
+                                .await
+                                .map_err(DataSourceError::Rpc)?;
+                                let Some(target) = armed_target else {
+                                    break;
+                                };
+                                gate_target = Some(gate_target.map_or(target, |t| t.max(target)));
+                                true
+                            }
+                            None => false,
+                        };
+                        #[cfg(not(feature = "datasource-rpc"))]
+                        let rearmed = false;
+                        // A reconnect cannot recover the slots without RPC repair, so only report.
+                        if !rearmed {
+                            error!(
+                                "Yellowstone slot {} arrived without the blocks after slot {covered}, and no RPC repair is configured",
+                                slot_update.slot
+                            );
+                        }
+                    }
+                    progress.handled(slot_update.slot, arrived);
                 }
                 Some(UpdateOneof::Block(block)) => {
                     metrics::INDEXER_CHAIN_TIP_SLOT
@@ -865,6 +941,7 @@ async fn connect_and_stream(
                         error!("Error handling block: {}", e);
                         return Err(DataSourceError::Rpc(e));
                     }
+                    progress.handled(forwarded.slot, arrived);
                     // A late block from inside the gap-fill range must not move the chain back.
                     if last_forwarded
                         .as_ref()
@@ -914,6 +991,7 @@ mod tests {
     use serde_json::json;
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
+    use std::str::FromStr;
     use tokio::sync::mpsc;
 
     /// An empty block whose parent link names the previous slot, so a run of these
@@ -1769,6 +1847,41 @@ mod tests {
         }
     }
 
+    /// Only a new highest slot restarts the window; anything else gives back its handling time.
+    #[tokio::test(start_paused = true)]
+    async fn progress_watchdog_moves_only_on_progress() {
+        enum Expect {
+            Restart,
+            GiveBack,
+        }
+        use Expect::*;
+        let window = Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        let mut watchdog = ProgressWatchdog::new(window);
+        assert_eq!(watchdog.deadline, tokio::time::Instant::now() + window);
+
+        // (silence before the message, time spent handling it, slot, expected effect)
+        let rows = [
+            (ms(10), ms(0), 0, Restart),
+            (ms(10), ms(50), 0, GiveBack),
+            (ms(10), ms(50), 5, Restart),
+            (ms(10), ms(20), 3, GiveBack),
+            (ms(10), ms(0), 6, Restart),
+        ];
+        for (silence, handling, slot, expect) in rows {
+            tokio::time::advance(silence).await;
+            let arrived = tokio::time::Instant::now();
+            tokio::time::advance(handling).await;
+            let before = watchdog.deadline;
+            watchdog.handled(slot, arrived);
+            let want = match expect {
+                Restart => tokio::time::Instant::now() + window,
+                GiveBack => before + handling,
+            };
+            assert_eq!(watchdog.deadline, want, "slot {slot}");
+        }
+    }
+
     /// Borsh-encoded WithdrawFunds payload (discriminator 0, amount, None destination)
     /// that `parse_withdraw_instruction` accepts.
     fn withdraw_funds_proto_data() -> Vec<u8> {
@@ -2118,6 +2231,80 @@ mod tests {
         );
     }
 
+    /// A feed that sends no `stack_height` still decodes two CPI escrow deposits,
+    /// each reading its own event, instead of tearing the stream down.
+    #[tokio::test]
+    async fn handle_transaction_decodes_cpi_escrow_deposits_without_stack_heights() {
+        use crate::operator::utils::account_util::find_instance_pda;
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes_full, deposit_ix_bytes};
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        let instance_seed = Pubkey::new_from_array([50u8; 32]);
+        // Escrow at key 0, foreign router at key 1 (also the user), instance PDA at 2, mint at 3.
+        let mut account_keys: Vec<Vec<u8>> = (0u8..12)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i + 1;
+                b.to_vec()
+            })
+            .collect();
+        account_keys[0] = escrow.to_bytes().to_vec();
+        account_keys[2] = find_instance_pda(&instance_seed).to_bytes().to_vec();
+        let user = Pubkey::try_from(account_keys[1].as_slice()).unwrap();
+        let mint = Pubkey::try_from(account_keys[3].as_slice()).unwrap();
+
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: vec![],
+        }];
+        let deposit = || proto::InnerInstruction {
+            program_id_index: 0,
+            accounts: (0u8..12).collect(),
+            data: deposit_ix_bytes(1000, None),
+            stack_height: None,
+        };
+        let event = |amount: u64| proto::InnerInstruction {
+            program_id_index: 0,
+            accounts: vec![],
+            data: deposit_event_bytes_full(instance_seed, user, amount, user, mint),
+            stack_height: None,
+        };
+        let inner_set = vec![proto::InnerInstructions {
+            index: 0,
+            instructions: vec![deposit(), event(300), deposit(), event(480)],
+        }];
+
+        let tx_update =
+            escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, None, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(m)) = rx.recv().await {
+            metas.push(m);
+        }
+
+        assert_eq!(metas.len(), 2, "both CPI deposits are indexed");
+        assert_eq!(metas[0].inner_index, Some(0));
+        assert_eq!(
+            escrow_deposit_amount(&metas[0]),
+            300,
+            "deposit A reads its own event"
+        );
+        assert_eq!(metas[1].inner_index, Some(2));
+        assert_eq!(
+            escrow_deposit_amount(&metas[1]),
+            480,
+            "deposit B reads its own event"
+        );
+    }
+
     /// A top-level escrow deposit whose program id is ALT-loaded is still parsed.
     /// Escrow is the readonly loaded key behind one writable loaded key, so it
     /// only resolves if loaded keys are appended writable-then-readonly after the
@@ -2274,6 +2461,36 @@ mod tests {
         match &msgs[0] {
             ProcessorMessage::SlotComplete { slot, .. } => assert_eq!(*slot, 700),
             _ => panic!("expected a lone SlotComplete"),
+        }
+    }
+
+    /// Rows carry the block position Yellowstone reports, not a count of what reached
+    /// us: the block filter has already dropped the unrelated transactions.
+    #[tokio::test]
+    async fn block_rows_carry_the_reported_transaction_index() {
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // The only transaction left after filtering, at position 5 in the full block.
+        let reported_index: u64 = 5;
+        let mut tx_info = withdraw_tx_update(vec![1u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        tx_info.index = reported_index;
+        let block = block_update(500, vec![tx_info]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        match rx.recv().await {
+            Some(ProcessorMessage::Instruction(instruction_meta)) => {
+                assert_eq!(
+                    u64::from(instruction_meta.transaction_index),
+                    reported_index
+                )
+            }
+            other => panic!("expected an instruction, got {other:?}"),
         }
     }
 
@@ -3028,6 +3245,10 @@ async fn handle_transaction_info(
     escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
+    // Position in the whole block as Yellowstone reports it. Never count it here: the
+    // block filter already dropped unrelated transactions. A block is far below u32 max.
+    let transaction_index = tx_info.index as u32;
+
     // A tx without meta cannot be proven successful or in scope (it loses its revert status,
     // CPI events, and v0 ALT keys), so fail closed rather than index it: the slot is not
     // checkpointed and gap-fill replays it, the same guard the getBlock backfill applies.
@@ -3126,6 +3347,7 @@ async fn handle_transaction_info(
             program_type,
             escrow_instance_id,
             slot,
+            transaction_index,
             &signature,
             channel,
         )
@@ -3159,6 +3381,7 @@ async fn handle_transaction_info(
                 program_type,
                 escrow_instance_id,
                 slot,
+                transaction_index,
                 &signature,
                 channel,
             )
@@ -3388,6 +3611,7 @@ async fn parse_and_send(
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
     slot: u64,
+    transaction_index: u32,
     signature: &str,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
@@ -3417,7 +3641,7 @@ async fn parse_and_send(
         // different responses. `parse_failed` means the checkpoint is stuck and nothing is
         // being indexed. Here the gap-fill usually decodes the slot from an endpoint with
         // fuller metadata, so no data is lost and the checkpoint keeps moving; what is wrong
-        // is that a systematic cause (a feed that cannot express CPI stack heights) makes
+        // is that a systematic cause (a feed with incomplete inner instructions) makes
         // this recur per block, so the stream tears down continuously and contributes
         // nothing while RPC quietly does its job. That is worth knowing about, but it is not
         // an emergency, and paging `parse_failed` for it would cry wolf on a healthy slot.
@@ -3448,6 +3672,7 @@ async fn parse_and_send(
         slot,
         program_type,
         signature: Some(signature.to_string()),
+        transaction_index,
         // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
         instruction_index: location.top_level_index,
         inner_index,

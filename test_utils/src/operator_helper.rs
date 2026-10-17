@@ -47,7 +47,8 @@ pub fn default_operator_config() -> OperatorConfig {
     }
 }
 
-fn set_operator_env_vars(keypair: &Keypair) {
+/// Memory signer env for both roles; `operator::run` loads signers before it starts.
+pub fn set_operator_env_vars(keypair: &Keypair) {
     let private_key_base58 = bs58::encode(keypair.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &private_key_base58);
@@ -132,7 +133,7 @@ pub async fn start_solana_to_private_channel_operator_with_config(
 //   - getSignatureStatuses      — poll-task confirmation loop
 //   - getSignaturesForAddress   — mint idempotency check
 //   - getAccountInfo            — mint initialization / JIT mint path
-//   - getBalance                — feepayer_monitor (escrow operators only)
+//   - getBalance                — feepayer_monitor (withdraw operators only)
 // Unscripted methods return JSON-RPC error -32603 ("no scripted response"),
 // which production paths treat as transient — usually harmless for tests
 // that care about a narrow failure mode and just want the rest of the

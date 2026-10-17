@@ -18,7 +18,7 @@ Real-time block streaming via gRPC (requires a gRPC endpoint). Handles both Escr
 
 Enumerates the producing slots in each batch with `getBlocks`, then fetches only those blocks in parallel with `getBlock`. Higher latency (~1-5 seconds) but no special infrastructure required.
 
-Slots and blocks are decoupled on a Solana Private Channels node: slots tick every `blocktime_ms` whether or not a block is produced, and an idle node produces one block per second. A batch window can therefore contain no block at all. When that happens the poller looks past the window with `getBlocksWithLimit` for the next producing slot and claims the range up to it, so `batch_size` caps how much work one batch does and never determines whether the indexer can advance. It is not coupled to the node's `blocktime_ms` or its idle block cadence. That search is bounded: a node heartbeats one block a second, so the widest idle gap is `1000 / blocktime_ms` slots and never more than 1 000, and the poller searches ten times that before treating the distance as a hole in the ledger rather than an idle stretch. The same bound is how far backfill looks below the chain tip for the last produced block, since the tip itself is usually a slot with no block and cannot anchor the range.
+Slots and blocks are decoupled on a Solana Private Channels node: slots tick every `blocktime_ms` whether or not a block is produced, and an idle node produces one block per second. A batch window can therefore contain no block at all. When that happens the poller looks past the window with `getBlocksWithLimit` for the next producing slot and claims the range up to it, so `batch_size` caps how much work one batch does and never determines whether the indexer can advance. It is not coupled to the node's `blocktime_ms` or its idle block cadence. That search is bounded: a node heartbeats one block a second, so the widest idle gap is `1000 / blocktime_ms` slots and never more than 1 000, and the poller searches ten times that before treating the distance as a hole in the ledger rather than an idle stretch. The same bound is how far backfill looks below the chain tip for the last produced block, since the tip itself is usually a slot with no block and cannot anchor the range. Both `indexer.rpc_polling.batch_size` and `indexer.backfill.batch_size` are capped at 100, and startup rejects a larger value wherever it would drive RPC batches (the live poller, backfill, and Yellowstone gap repair, which uses the backfill value even with backfill off): every RPC request has a fixed 60 s deadline sized for a 100-block batch, so a larger batch would time out on every retry.
 
 **Location**: [`indexer/src/indexer/datasource/rpc_polling/`](../indexer/src/indexer/datasource/rpc_polling/)
 
@@ -41,6 +41,9 @@ Recovers missed slots on indexer restart or network issues:
      cannot be proven empty aborts the batch rather than being checkpointed past
    - Process blocks in order
    - Update checkpoint per slot via `CheckpointWriter` (driven by `SlotComplete` events)
+   - If the fill fails (retries exhausted, or a slot it cannot fetch or decode), the indexer
+     stops the live source and exits non-zero, so the supervisor restarts it and the gap is
+     refilled from the durable checkpoint
 4. For the Yellowstone datasource, persist a startup anchor before the live stream runs, so a
    durable checkpoint always exists: every connection, the first one included, replays from it up
    to the slot the stream opened at, and withholds live slots rather than advancing the checkpoint
@@ -148,6 +151,12 @@ if anything fails. It is guarded these ways.
    program but the rebuild replays only from the genesis slot, so a genesis above the
    program's earliest row refuses before anything is deleted. The marker keeps the lowest
    slot its wipe deleted, so a rerun after an interrupted resync is held to the same bound.
+8. **The channel history must be complete.** The channel writes its address index after
+   each block commits, so its history can briefly miss a mint that is already final.
+   Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until
+   the index covers the block that was newest at its first read, and refuses before anything is deleted
+   if it never does or the method is unavailable. Deploy core and the gateway before
+   the indexer.
 
 The delete runs in one transaction on the lock session and is capped at 300s. Measured at
 roughly 30k deposit rows a second with one journal each (6s for 200k rows, 30s for 1M), so
@@ -181,9 +190,27 @@ Each indexed instruction is keyed on the triple **`(signature, instruction_index
 - `instruction_index` — absolute position of the top-level instruction (or, for a CPI, of its top-level ancestor) in the transaction.
 - `inner_index` — `NULL` for a top-level instruction; otherwise the instruction's position in the **flattened inner-instruction list** of that top-level ancestor.
 
-**This works at any CPI depth, not just one level.** The validator flattens *every* CPI depth under a top-level instruction into a single inner-instruction list (`meta.innerInstructions[i].instructions`), each entry carrying a `stackHeight`. So a deposit invoked two or more hops deep (`A → B → escrow.Deposit`) is still one entry in that flat list with a unique `inner_index` — `inner_index` is a flat position, **not** a nesting level. Deposit-event scoping likewise keys on `stackHeight` (it walks the contiguous run of deeper entries after the deposit), so it resolves the correct `DepositEvent` regardless of nesting depth.
+**This works at any CPI depth, not just one level.** The validator flattens *every* CPI depth under a top-level instruction into a single inner-instruction list (`meta.innerInstructions[i].instructions`), each entry carrying a `stackHeight`. So a deposit invoked two or more hops deep (`A → B → escrow.Deposit`) is still one entry in that flat list with a unique `inner_index` — `inner_index` is a flat position, **not** a nesting level. Deposit-event scoping likewise keys on `stackHeight` (it walks the contiguous run of deeper entries after the deposit), so it resolves the correct `DepositEvent` regardless of nesting depth. When a source omits the CPI deposit's own `stackHeight`, the parser takes the first escrow entry after the deposit instead. The list is in call order and nothing inside a Deposit can call the escrow except its own event self-CPI, so that entry must be this deposit's `DepositEvent`. It must also name the deposit's instance, user, recipient and mint, or the slot fails to decode.
 
 **Locations**: identity column [`indexer/src/storage/common/models.rs`](../indexer/src/storage/common/models.rs); position capture [`InstructionLocation`/`InnerLocation`](../indexer/src/indexer/datasource/common/types.rs); event scoping `parse_deposit` in [`escrow.rs`](../indexer/src/indexer/datasource/common/parser/escrow.rs).
+
+### Mint status history
+
+Each AllowMint and BlockMint writes one `mint_status_history` row, keyed on its source
+instruction and ordered by block position (slot, transaction, instruction, inner
+instruction). A BlockMint that leaves deposits open writes `allowed`. Status is read three ways:
+
+- **Deposit in a slot with changes**: allowed if the status coming into the slot is
+  `allowed` or any change inside it is. Order inside the slot is ignored: the program
+  refuses blocked deposits and only successful transactions are indexed, so a deposit
+  row proves the gate was open when it ran.
+- **Deposit in a later slot**: the last change by block position decides.
+- **`mints` mirror** (`status`, `withdrawals_blocked`): the last change by block position.
+
+The operator gate and the reconciliation orphan query use the same rule.
+
+**Locations**: `get_mint_status_at_slot_internal`, `get_orphan_deposit_ids_internal` and
+`sync_mint_status_internal` in [`db.rs`](../indexer/src/storage/postgres/db.rs).
 
 
 ## Operator Components
@@ -225,13 +252,13 @@ Submits transactions to the respective cluster with:
 
 #### Reconciliation
 
-Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation checks two per-mint invariants over finalized reads and fails closed on a proven insolvency: `channel_supply <= custody` beyond the in-flight envelope (over-issuance), and ledger liabilities `<= custody` (a drain), where liabilities are all deposits minus the releases the escrow indexer observed, both at the custody slot once the indexer's checkpoint covers it. Either breach for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md). A release discharges what the chain says it moved, capped at what its withdrawal row owed. A tick that cannot pin the ledger leaves the liability arm unarmed, which is counted, exported and alerted on rather than passing silently. Custody is read from the escrow instance's ATA for each known mint, so the read cannot be inflated by accounts others create for the escrow. Channel supply only counts when the node's newest block is under 120 s old (and not stamped more than 120 s ahead) and the read answered at or after it; a read behind it is re-read up to three times (at most six per tick across all mints) before it counts as stale. Each mint's custody is compared with the ledger at the slot its custody read answered at, so custody read in batches need not share one slot, but every batch must answer at or after Solana's newest finalized block, which must itself be under 120 s old; batches send that block as `minContextSlot`, so a lagging backend's refusal is retried. A tick that cannot read a required input (mint set, custody, envelope, fresh supply, the escrow checkpoint, ledger rows) is a dark tick; three in a row halt without quarantining withdrawals. That outage halt never replaces an insolvency halt, while a breach confirmed during it still quarantines and replaces it, and `/health` is only forced to 503 once the halt flag has been written, with an outage reason replaced by the insolvency reason on an upgrade. The halt is also enforced in the claim that precedes every mint and release broadcast (a refused row that never broadcast goes back to `pending` without spending a requeue attempt), and a fetcher that cannot read the flag skips its poll. Reconciliation is a supervised task on the escrow operator, so if it dies the operator restarts. Startup runs the same supply invariant and the same custody-vs-ledger comparison before the pipeline boots; when its ledger checkpoint sits below the custody snapshot it re-reads the ledger with completed withdrawals counted as released, so indexer lag cannot fail a healthy boot and an unexplained shortfall still stops it.
+Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation checks two per-mint invariants over finalized reads and fails closed on a proven insolvency: `channel_supply <= custody` beyond the in-flight envelope (over-issuance), and ledger liabilities `<= custody` (a drain), where liabilities are all deposits minus the releases the escrow indexer observed, both at the custody slot once the indexer's checkpoint covers it. Either breach for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md). A release discharges what the chain says it moved, capped at what its withdrawal row owed. A tick that cannot pin the ledger leaves the liability arm unarmed, which is counted, exported and alerted on rather than passing silently. Custody is read from the escrow instance's ATA for each known mint, so the read cannot be inflated by accounts others create for the escrow. Channel supply only counts when the node's newest block is under 120 s old (and not stamped more than 120 s ahead) and the read answered at or after it; a read behind it is re-read up to three times (at most six per tick across all mints) before it counts as stale. Each mint's custody is compared with the ledger at the slot its custody read answered at, so custody read in batches need not share one slot, but every batch must answer at or after Solana's newest finalized block, which must itself be under 120 s old; batches send that block as `minContextSlot`, so a lagging backend's refusal is retried. A tick that cannot read a required input (mint set, custody, envelope, fresh supply, the escrow checkpoint, ledger rows) is a dark tick; three in a row halt without quarantining withdrawals. That outage halt never replaces an insolvency halt, while a breach confirmed during it still quarantines and replaces it, and `/health` is only forced to 503 once the halt flag has been written, with an outage reason replaced by the insolvency reason on an upgrade. The halt is also enforced in the claim that precedes every mint and release broadcast (a refused row that never broadcast goes back to `pending` without spending a requeue attempt), and a fetcher that cannot read the flag skips its poll. Reconciliation is a supervised task on the escrow operator, so if it dies the operator restarts. Startup runs the same supply invariant and the same custody-vs-ledger comparison before the pipeline boots; when its ledger checkpoint sits below the custody snapshot it re-reads the ledger with completed withdrawals counted as released, so indexer lag cannot fail a healthy boot and an unexplained shortfall still stops it. `indexer -c <escrow indexer config> reconcile` runs that comparison once, read-only and under the shared live-state lock so a resync cannot delete the ledger mid-run, after waiting for the escrow checkpoint to cover the custody slot, so status never stands in for an observed release; it exits 0 on a pass, 1 on a shortfall or supply breach, 2 on an error and 3 when the ledger never reaches the custody slot or a resync is rebuilding it.
 
 **Location**: [`indexer/src/operator/reconciliation.rs`](../indexer/src/operator/reconciliation.rs), [`indexer/src/indexer/reconciliation.rs`](../indexer/src/indexer/reconciliation.rs)
 
 #### DB Transaction Writer
 
-Handles batched database writes for transaction status updates from the operator pipeline.
+Writes operator status updates one at a time and posts their alert webhooks from a separate bounded queue, so a slow endpoint never delays a write. Once the pipeline is running, `Failed` and `ManualReview` outcomes for a `processing` row are written by their producer as a CAS on that incarnation's `updated_at` and reach the writer as alert-only updates, so a late outcome cannot terminalize a row recovery has requeued. The writer still writes deposit `Completed`, `pending_remint` outcomes and boot repair itself, none of which can meet a second incarnation.
 
 **Location**: [`indexer/src/operator/db_transaction_writer.rs`](../indexer/src/operator/db_transaction_writer.rs)
 

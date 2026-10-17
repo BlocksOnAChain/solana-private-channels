@@ -31,7 +31,7 @@ async fn main() {
     info!("Starting private-channel-auth on port {}", config.port);
 
     let pool = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
+        .max_connections(config.database_max_connections.get())
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
         .connect(&config.database_url)
         .await
@@ -46,7 +46,7 @@ async fn main() {
     let auth_throttle = Arc::new(AuthThrottle::new(
         config.auth_rate_limit_per_second,
         config.auth_rate_limit_burst,
-        config.auth_username_attempts_per_minute,
+        config.auth_username_failed_logins_per_minute,
     ));
     throttle::spawn_pruner(auth_throttle.clone());
 

@@ -156,14 +156,14 @@ pub mod rpc_blocks {
     }
 }
 
-/// Byte-layout builders for escrow Deposit instructions and their DepositEvent
-/// self-CPI. Centralised here so the escrow parser tests and the decoder tests
-/// build the exact same bytes against one source of truth (the `pub(crate)`
-/// escrow constants), rather than each re-encoding the layout.
+/// Byte-layout builders for escrow Deposit and ReleaseFunds instructions and the
+/// DepositEvent self-CPI. Centralised here so the escrow parser tests and the
+/// decoder tests build the exact same bytes against one source of truth (the
+/// `pub(crate)` escrow constants), rather than each re-encoding the layout.
 #[cfg(any(test, feature = "test-mock-storage"))]
 pub mod escrow_fixtures {
     use crate::indexer::datasource::common::parser::escrow::{
-        DEPOSIT, DEPOSIT_EVENT_DISCRIMINATOR, EVENT_IX_TAG_LE,
+        DEPOSIT, DEPOSIT_EVENT_DISCRIMINATOR, EVENT_IX_TAG_LE, RELEASE_FUNDS,
     };
     use solana_sdk::pubkey::Pubkey;
 
@@ -188,17 +188,46 @@ pub mod escrow_fixtures {
         data
     }
 
-    /// DepositEvent self-CPI bytes (145B): tag(8) + disc(1) + instance_seed(32)
-    /// + user(32) + amount(8 LE) + recipient(32) + mint(32).
+    /// Borsh body of a ReleaseFunds instruction (after the discriminator):
+    /// amount (u64 LE) + user (32) + transaction_nonce (u64 LE).
+    pub fn release_funds_borsh(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
+        let mut data = amount.to_le_bytes().to_vec();
+        data.extend_from_slice(user.as_ref());
+        data.extend_from_slice(&nonce.to_le_bytes());
+        data
+    }
+
+    /// Full ReleaseFunds *instruction* bytes: discriminator + borsh body. Pre-base58.
+    pub fn release_funds_ix_bytes(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
+        let mut data = vec![RELEASE_FUNDS];
+        data.extend(release_funds_borsh(amount, user, nonce));
+        data
+    }
+
+    /// DepositEvent self-CPI bytes (145B) with zero-filled identity fields; use
+    /// `deposit_event_bytes_full` to set them.
     pub fn deposit_event_bytes(amount: u64) -> Vec<u8> {
+        let zero = Pubkey::default();
+        deposit_event_bytes_full(zero, zero, amount, zero, zero)
+    }
+
+    /// DepositEvent self-CPI bytes: tag(8) + disc(1) + instance_seed(32) + user(32)
+    /// + amount(8 LE) + recipient(32) + mint(32).
+    pub fn deposit_event_bytes_full(
+        instance_seed: Pubkey,
+        user: Pubkey,
+        amount: u64,
+        recipient: Pubkey,
+        mint: Pubkey,
+    ) -> Vec<u8> {
         let mut data = Vec::with_capacity(145);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(DEPOSIT_EVENT_DISCRIMINATOR);
-        data.extend_from_slice(&[0u8; 32]); // instance_seed
-        data.extend_from_slice(&[0u8; 32]); // user
+        data.extend_from_slice(instance_seed.as_ref());
+        data.extend_from_slice(user.as_ref());
         data.extend_from_slice(&amount.to_le_bytes());
-        data.extend_from_slice(&[0u8; 32]); // recipient
-        data.extend_from_slice(&[0u8; 32]); // mint
+        data.extend_from_slice(recipient.as_ref());
+        data.extend_from_slice(mint.as_ref());
         data
     }
 }
@@ -485,5 +514,85 @@ pub mod rpc_mocks {
             ))
             .create_async()
             .await
+    }
+}
+
+#[cfg(test)]
+pub mod stall_server {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// How a stalled connection hangs.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Stall {
+        /// Never answers.
+        BeforeHeaders,
+        /// Sends headers and part of the body, then goes silent.
+        AfterHeaders,
+    }
+
+    /// Local server whose first `stall_first` connections hang and the rest pipe to `upstream`; returns its URL and accept count.
+    pub async fn stall_server(
+        stall: Stall,
+        stall_first: usize,
+        upstream: Option<String>,
+    ) -> (String, Arc<AtomicUsize>) {
+        serve(stall, upstream, move |index| index < stall_first).await
+    }
+
+    /// Like `stall_server`, but the first `forward_first` connections pipe to `upstream` and the rest hang.
+    pub async fn stall_server_after(
+        stall: Stall,
+        forward_first: usize,
+        upstream: String,
+    ) -> (String, Arc<AtomicUsize>) {
+        serve(stall, Some(upstream), move |index| index >= forward_first).await
+    }
+
+    async fn serve(
+        stall: Stall,
+        upstream: Option<String>,
+        stalls: impl Fn(usize) -> bool + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                // Decided at accept time so a forwarded connection is never read here first.
+                let stalled = stalls(counter.fetch_add(1, Ordering::SeqCst));
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if stalled {
+                        hang(socket, stall).await;
+                    } else if let Some(upstream) = upstream {
+                        forward(socket, &upstream).await;
+                    }
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    async fn hang(mut socket: TcpStream, stall: Stall) {
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        if let Stall::AfterHeaders = stall {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(br#"{"jsonrpc":"2.0","#).await;
+        }
+        // Keep the socket open: a closed one fails fast instead of timing out.
+        std::future::pending::<()>().await;
+    }
+
+    async fn forward(mut socket: TcpStream, upstream: &str) {
+        if let Ok(mut target) = TcpStream::connect(upstream).await {
+            let _ = tokio::io::copy_bidirectional(&mut socket, &mut target).await;
+        }
     }
 }

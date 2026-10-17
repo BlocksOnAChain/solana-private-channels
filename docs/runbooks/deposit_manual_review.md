@@ -68,7 +68,8 @@ to the right Path below.
 
 | `error_message` contains | Cause |
 |---|---|
-| `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path F**. |
+| `has no allowed status in mint_status_history` | The deposit's `mint` was not `allowed` in `mint_status_history` coming into the deposit's slot or by a change inside it. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint`, or `BlockMint` that left deposits open, authorizes it. Row data is fine; no on-chain mint attempted. See **Path F**. |
+| `withdraw config unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee and minimum the deposit must write to the channel are unknown (metric label `withdraw_config_unknown`). This happens when the mint's `AllowMint` was never indexed (the indexer started after it) but a later `BlockMint` that re-opened deposits was, since that writes an `allowed` status without a `mints` row; a missed `AllowMint` alone trips the allowlist gate (Path F) first. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee and minimum, and its history insert adds the `AllowMint`'s own row, which is harmless because the later `BlockMint` still decides the status. Then re-arm. |
 
 Pull the row:
 
@@ -88,8 +89,8 @@ solana confirm -v <signature> --url <solana-rpc-url>
 
 ## Recovery
 
-Processor-side and allowlist quarantines (Paths A/B/C/F) trigger on row-data
-validation before any mint is attempted, so they do not need on-chain mint
+Processor-side and allowlist quarantines (Paths A/B/C/F, and
+`withdraw config unknown`) trigger before any mint is attempted, so they do not need on-chain mint
 verification before recovery. The signature-driven recovery worker (Path E)
 is the gate against a double-mint: it re-arms (`pending`) only a deposit it
 has proven did not mint - either no signature was ever persisted (so it was
@@ -199,10 +200,11 @@ Compare the displayed `Mint authority` to the operator's current
 admin pubkey.
 
 - **Authority mismatch — current authority still accessible.**
-  Treasury / admin signs
+  Treasury / admin signs, with the current operator admin as fee payer
+  since the node requires a configured admin signer,
 
   ```bash
-  spl-token authorize <mint> mint-authority <new-authority>
+  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair> --url <private-channel-rpc>
   ```
 
   to point the mint at the current operator admin. Then re-arm to
@@ -301,15 +303,18 @@ Stop. [Escalate](_escalation.md) (Tier 2). Do not act.
 ### Path F - mint not in `AllowMint` allowlist
 
 `error_message`: `has no allowed status in mint_status_history`. The deposit's
-mint has no `allowed` entry in `mint_status_history` at the deposit's slot (the
-`mints` row may exist); the operator refused to mint on the private channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
+mint was not `allowed` in `mint_status_history` coming into the deposit's slot or
+by a change inside it (the `mints` row may exist); the operator refused to mint on the private channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
 apply. Steps 1–2 diagnose *why* the allowlist row is missing; Steps 3a–3c
 are the recovery branches.
 
 #### Step 1 - check whether the gap closed on its own
 
-A race is possible: the gate fired because `mints` was empty at process
-time, but the indexer may have caught up since. Confirm the current state:
+The operator claims a deposit only once the escrow checkpoint
+(`indexer_state.last_committed_slot` for `escrow`) covers its slot, so a
+reconnect repair can no longer cause this refusal. A row quarantined by an
+older operator may still be that race: the mint's history was incomplete at
+process time, but the indexer may have caught up since. Confirm the current state:
 
 ```sql
 SELECT id, signature, mint, slot FROM transactions WHERE id = :transaction_id;
@@ -336,8 +341,8 @@ which recovery branch to take:
 
 | Finding | Branch |
 |---|---|
-| Found, slot < deposit slot. | **3a — indexer gap.** |
-| Found, slot ≥ deposit slot. | **Escalate (Tier 1).** Retroactive allowlist; treasury policy call. |
+| Found, slot ≤ deposit slot. | **3a — indexer gap.** Same slot is fine: the deposit succeeded, so the mint was allowed when it ran. |
+| Found, slot > deposit slot. | **Escalate (Tier 1).** Retroactive allowlist; treasury policy call. |
 | Not found after a full pass. | **3b — terminal.** |
 | Found but bound to a different `instance`. | **3c — Tier 3 defect.** |
 
@@ -348,21 +353,35 @@ Replay the indexer over the `AllowMint`'s slot (preferred — same code path
 as production), or insert directly. The gate (`assert_mint_allowed_at_slot`)
 reads **`mint_status_history`**, so backfilling only `mints` loops
 `pending` → `manual_review` forever — both rows are required. Values must
-match the on-chain mint. `status` and `withdrawals_blocked` are left to their
-defaults (`allowed`, open), which is what an `AllowMint` sets:
+match the on-chain mint. `withdraw_fee` and `min_withdraw_amount` are that
+`AllowMint`'s arguments (bytes 2..10 and 10..18 of its instruction data, u64 LE),
+recorded with the same `:allow_mint_slot` so a replayed older AllowMint cannot
+restore older values. Set `min_withdraw_amount` explicitly: its column defaults
+to 0, which would leave the mint with no minimum. `status` and
+`withdrawals_blocked` are left to their defaults (`allowed`, open), which is
+what an `AllowMint` sets:
 
 ```sql
 INSERT INTO mints
-  (mint_address, decimals, token_program, created_at)
+  (mint_address, decimals, token_program, withdraw_fee, min_withdraw_amount,
+   allow_mint_slot, created_at)
 VALUES
-  (:mint, :decimals, :token_program, NOW());
+  (:mint, :decimals, :token_program, :withdraw_fee, :min_withdraw_amount,
+   :allow_mint_slot, NOW());
 
--- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
+-- Clears the slot-aware gate. Every value comes from the AllowMint:
+--   :allow_mint_tx_index    its transaction's position in getBlock(slot).transactions,
+--                           counting failed transactions too
+--   :allow_mint_ix_index    its instruction's position in that transaction
+--   :allow_mint_inner_index its position in that instruction's inner instructions,
+--                           or NULL when it is a top-level instruction
 INSERT INTO mint_status_history
-  (mint_address, status, effective_slot, signature, created_at)
+  (mint_address, status, effective_slot, transaction_index, instruction_index,
+   inner_index, signature, created_at)
 VALUES
-  (:mint, 'allowed', :allow_mint_slot, :allow_mint_signature, NOW())
-ON CONFLICT (mint_address, effective_slot) DO NOTHING;
+  (:mint, 'allowed', :allow_mint_slot, :allow_mint_tx_index, :allow_mint_ix_index,
+   :allow_mint_inner_index, :allow_mint_signature, NOW())
+ON CONFLICT (signature, instruction_index, COALESCE(inner_index, -1)) DO NOTHING;
 
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;

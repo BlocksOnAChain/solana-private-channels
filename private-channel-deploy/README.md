@@ -155,6 +155,14 @@ Tunable via env vars (see [`scripts/sanity.sh`](./scripts/sanity.sh) header). Sa
 
 Operator feepayer balance is **not** a sanity gate. It's monitored continuously via the `feepayer-warn-balance` (< 1 SOL, warning) and `feepayer-low-balance` (< 0.5 SOL, critical) Grafana alerts in [`monitoring/provisioning/alerting/alert-rules.yml`](../monitoring/provisioning/alerting/alert-rules.yml). A fresh deploy with an unfunded feepayer no longer fails sanity; alerts will fire if it stays unfunded.
 
+`feepayer-burn-rate` (more than 0.05 SOL spent in an hour, warning) catches a drain before those floors, for example a zero-fee mint whose withdrawals keep failing and being reminted. To find the mint, run this against the indexer DB as its owner (the Grafana login cannot read `transactions`):
+
+```sql
+SELECT mint, status, COUNT(*) FROM transactions WHERE transaction_type = 'withdrawal' AND updated_at > NOW() - INTERVAL '1 hour' GROUP BY mint, status ORDER BY 3 DESC;
+```
+
+Then block that mint's withdrawals, or reprice it with a nonzero fee (see the [zero-fee warning](../docs/ESCROW_INTERACTION_GUIDE.md#allowmint)).
+
 ## Monitoring
 
 Default-on (skip with `--skip-tags monitoring`). PHASE 6 brings up Prometheus + Grafana + cAdvisor + node_exporter + postgres_exporter + blackbox-exporter on the private-channel Docker network via a sibling `monitoring.compose.yml`.
@@ -177,5 +185,5 @@ Dashboard JSON + alerting rules live under [`monitoring/`](../monitoring/) — e
 ## Potential future improvements
 
 - **Encrypt `secrets.yml` with SOPS+age** so it can live in git instead of travelling out of band.
-- **Harden runtime alert delivery** (timeouts, retries, rate-limit, dead-letter) — today it's a fire-and-forget POST to `ALERT_WEBHOOK_URL`. Until then, route alerts via Grafana, which handles those concerns.
+- **Harden runtime alert delivery** (timeouts, retries, rate-limit, dead-letter) — today each alert is posted once to `ALERT_WEBHOOK_URL` (10s timeout) from a bounded queue that drops and counts overflow. Until then, route alerts via Grafana, which handles those concerns.
 - **CI-built images via GHCR** instead of building on the deploy host (~3 min faster, pull-only deploys).

@@ -147,9 +147,16 @@ gauge_vec!(
 );
 
 gauge_vec!(
+    OPERATOR_PENDING_REMINTS,
+    "private_channel_operator_pending_remints",
+    "Deferred remints in the withdraw sender after its last tick, including backlog rows not loaded yet",
+    &["program_type"]
+);
+
+gauge_vec!(
     FEEPAYER_BALANCE_LAMPORTS,
     "private_channel_feepayer_balance_lamports",
-    "Current SOL balance of the escrow operator feepayer wallet in lamports",
+    "Current SOL balance of the withdraw operator feepayer wallet in lamports",
     &["program_type"]
 );
 
@@ -165,9 +172,10 @@ counter_vec!(
     &["program_type", "reason"]
 );
 
-/// Reason labels for the withdrawal bails that park one row and leave the
-/// pipeline running. Kept here so the emitting code and the pre-registration
-/// below read one list and a label cannot exist in only one of them.
+/// Reason labels for the bails that park one row and leave the pipeline
+/// running, withdrawal-side except where noted. Kept here so the emitting code
+/// and the pre-registration below read one list and a label cannot exist in
+/// only one of them.
 pub const BAIL_REASON_UNSUPPORTED_MINT: &str = "unsupported_mint";
 pub const BAIL_REASON_WITHDRAWALS_BLOCKED: &str = "withdrawals_blocked";
 pub const BAIL_REASON_TARGET_MINT_MISSING: &str = "target_mint_missing";
@@ -176,8 +184,12 @@ pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
 pub const BAIL_REASON_ESCROW_FROZEN: &str = "escrow_frozen";
 pub const BAIL_REASON_HOOK_UNRESOLVABLE: &str = "hook_unresolvable";
 pub const BAIL_REASON_MINT_PROFILE_MISMATCH: &str = "mint_profile_mismatch";
+pub const BAIL_REASON_DESTINATION_REFUSES_CREDITS: &str = "destination_refuses_credits";
+/// Deposit-side: no `mints` row, so the fee and minimum the channel's withdraw
+/// config needs are unknown.
+pub const BAIL_REASON_WITHDRAW_CONFIG_UNKNOWN: &str = "withdraw_config_unknown";
 
-pub const BAIL_REASONS: [&str; 8] = [
+pub const BAIL_REASONS: [&str; 10] = [
     BAIL_REASON_UNSUPPORTED_MINT,
     BAIL_REASON_WITHDRAWALS_BLOCKED,
     BAIL_REASON_TARGET_MINT_MISSING,
@@ -186,6 +198,8 @@ pub const BAIL_REASONS: [&str; 8] = [
     BAIL_REASON_ESCROW_FROZEN,
     BAIL_REASON_HOOK_UNRESOLVABLE,
     BAIL_REASON_MINT_PROFILE_MISMATCH,
+    BAIL_REASON_DESTINATION_REFUSES_CREDITS,
+    BAIL_REASON_WITHDRAW_CONFIG_UNKNOWN,
 ];
 
 // Supervision: a critical task inside the operator exited.  The supervisor
@@ -209,6 +223,13 @@ gauge_vec!(
     OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
     "private_channel_operator_reconciliation_liability_shortfall_raw",
     "Raw tokens by which ledger liabilities exceed custody, exported every tick whether or not it breaches the halt tolerance",
+    &["mint"]
+);
+
+gauge_vec!(
+    OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
+    "private_channel_operator_reconciliation_envelope_adjustment_raw",
+    "Raw tokens of settled transfers newer than the custody or supply snapshot, allowed on top of the in-flight envelope",
     &["mint"]
 );
 
@@ -392,16 +413,21 @@ pub fn init_labels(program_type: &str) {
         "release_claim_lost",
         "halted_before_broadcast",
         "halt_read_error",
+        "pending_remint_page_read_failed",
         "release_missing_claim_lease",
         "jit_missing_claim_lease",
         "malformed_status_response",
         "status_poll_rpc_error",
+        "alert_queue_full",
+        "alert_drain_dropped",
+        "alert_post_failed",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }
 
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
-    FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
+    // FEEPAYER_BALANCE_LAMPORTS is seeded by the withdraw operator's monitor, the only
+    // writer; seeding it here would pin every other process at a 0 SOL balance.
 
     // Quarantine reasons must match the string constants returned by
     // `classify_processor_error` in processor.rs - any mismatch is a dead
@@ -530,6 +556,7 @@ pub fn init() {
         OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
         OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
+        OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
     );
 }
 
@@ -578,7 +605,6 @@ mod tests {
             "private_channel_operator_db_update_errors_total",
             "private_channel_operator_mints_sent_total",
             "private_channel_operator_backlog_depth",
-            "private_channel_feepayer_balance_lamports",
             "private_channel_operator_remint_claim_lost_total",
             "private_channel_operator_reconciliation_input_dark_ticks",
         ];
@@ -591,6 +617,17 @@ mod tests {
                 name
             );
         }
+
+        // Only the withdraw operator pays release fees, so a seeded balance would sit at
+        // zero in every other process.
+        let seeded_fee_payer = prometheus::gather().iter().any(|family| {
+            family.name() == "private_channel_feepayer_balance_lamports"
+                && metric_with_labels(family, &[("program_type", program_type)])
+        });
+        assert!(
+            !seeded_fee_payer,
+            "init_labels must not seed the fee payer balance"
+        );
     }
 
     #[test]
@@ -617,7 +654,6 @@ mod tests {
             "private_channel_operator_transaction_errors_total",
             "private_channel_operator_mints_sent_total",
             "private_channel_operator_backlog_depth",
-            "private_channel_feepayer_balance_lamports",
             "private_channel_operator_transaction_quarantined_total",
             "private_channel_operator_task_exit_total",
             "private_channel_operator_stale_processing_recovered_total",
@@ -635,10 +671,10 @@ mod tests {
             );
         }
 
-        // The live-state lock family is deliberately not in the list above. Gathering
-        // reports only families that already carry a series, and its series are created
-        // with the role label when a role takes the lock, not by init. Asserting on its
-        // absence here would depend on test ordering, since sibling tests in this same
-        // process create those series.
+        // The live-state lock and fee payer families are deliberately not in the list
+        // above. Gathering reports only families that already carry a series, and theirs
+        // are created when a role takes the lock or the fee payer monitor starts, not by
+        // init. Asserting on their absence here would depend on test
+        // ordering, since sibling tests in this same process create those series.
     }
 }

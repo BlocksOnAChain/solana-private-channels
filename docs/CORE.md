@@ -112,29 +112,48 @@ arrives whole before it can be counted, so that bound covers what a fetch return
 not that brief reply.
 
 **Resident account memory**: the preload budget bounds one fetch, but the cache
-keeps what it loads, so BOB is also capped by bytes (1 GiB) as well as by entry
-count. After each preload lands, clean entries are evicted largest first until the
-cache is back under 90% of that cap. The accounts the preload was asked for are
-never evicted, and neither are unsettled writes, so resident account data stays
-within the cap plus one preload. Rows are decoded as they stream in, so a preload
-briefly costs about 1.07 times the bytes it fetches. Results leaving the executor
+keeps what it loads, so BOB is capped by entry count (1,000,000) and by bytes
+(1 GiB). Both caps run after each preload lands: the entry cap evicts the oldest
+clean entries first and the byte cap the largest, each until the cache is back
+under 90% of its cap. The accounts the preload was asked for are never evicted,
+and neither are unsettled writes, so every account the batch reads reaches the
+SVM. Resident entries and account data each stay within the cap plus one preload
+plus the writes the settler has not yet acknowledged, since only clean entries
+can be evicted. Rows are decoded as they stream in, so a preload briefly costs about
+1.07 times the bytes it fetches. Results leaving the executor
 keep writable account data and every account's lamports but drop readonly data,
 which nothing downstream reads; otherwise a result would keep an evicted account
 alive until the settler had finished with it.
 
-**Blockhash expiry**: the live window keeps advancing while a batch waits on
-that account load, so validity is checked twice. The check on arrival only
-avoids loading accounts for a transaction that is already dead; the check after
-the load is the one that decides whether a transaction may run, and the run from
-it to both VM dispatches is synchronous, so what remains between the verdict and
-the dispatch is microseconds rather than a whole account load. Neither VM would
-catch a stale transaction later, since Core supplies successful transaction
-prechecks and a default processing blockhash. Without the second check a
-transaction could expire while its accounts loaded and still execute beside the
-replacement a client signs once `isBlockhashValid` reports the original hash
-dead, debiting the sender twice. A transaction dropped this way is never
-settled, so it stays absent from `getSignatureStatuses` exactly as one dropped
-on arrival does.
+**Blockhash expiry**: a transaction commits in a block whose height is at most
+`lastValidBlockHeight + 1` of its blockhash, or it never commits. The live window
+keeps advancing while a batch waits on its account load, so validity is checked
+twice. The check on arrival only avoids loading accounts for a transaction that
+is already dead. The check after the load decides whether a transaction may run.
+Under the same read lock it counts the batch as an *admission* if anything in it
+is still live, and the last results message of that batch carries the admission's
+number. Neither VM would catch a stale transaction later, since Core supplies
+successful transaction prechecks and a default processing blockhash.
+
+Before it cuts each block, the settler retires the hash that block expires under
+the window's write lock, and counts the block as announced in the same step. If
+it retired anything, it keeps receiving results, past its buffer caps if need be,
+until the last message of every admission made before the retire has arrived,
+and puts them all in this block. An admission either came first and lands in this
+block, or came after and found the hash gone. So once `getBlockHeight` is above a
+hash's `lastValidBlockHeight`, every transaction built on it that will ever
+commit is already readable, because a block's statuses and its height commit in
+one Postgres transaction. From the retire until dedup takes in the new block's
+hash, which is after that block commits, `isBlockhashValid` answers the retryable
+"catching up" error for the retired hash rather than `false`. So `false` means
+the original can no longer land, not that it did not, and it comes from the write
+node while `getSignatureStatuses` is served by a read replica that can lag. A
+client may re-sign only after `getBlockHeight` is above the old
+`lastValidBlockHeight` and a `getSignatureStatuses` read made after that height
+read, on the same endpoint, is still `null`; otherwise the original and its
+replacement can both execute. A transaction dropped by either
+check is never settled, so it stays absent from `getSignatureStatuses` exactly as
+one dropped on arrival does.
 
 
 **Execution Modes**:
@@ -178,11 +197,13 @@ This eliminates the operational overhead of funding user accounts for off-chain 
 These synthesized lamports are the only lamports in the channel that were never deposited, so the execution stage treats them as a loan the transaction must repay. After a successful regular transaction, every writable account the SVM loaded that BOB had never seen is examined:
 
 - A synthesized fee payer must end holding the same amount it was handed. Whatever it is short by is the unrepaid part of the loan.
-- Each account the transaction created may keep one lamport of that shortfall, because the SVM requires a live account to hold at least one and, with rent at zero, every creation path funds exactly one.
+- Each account the transaction created may keep one lamport of that shortfall, because the SVM requires a live account to hold at least one and, with rent at zero, every creation path funds exactly one. A new System-owned account with no data does not count as a creation, and at most 4 accounts per transaction may be created while the float is short (CreateDvp's 4 is the most any flow needs).
 - While any of the float is missing, no account that already existed may end richer than it started. Counting creations does not prove the float paid for them, so without this a creation funded by real money could licence a fabricated lamport landing somewhere durable. With the float intact, pre-existing accounts move real lamports freely.
-- If the shortfall exceeds the allowance, or a pre-existing balance grew while the float was short, the transaction is failed with `UnbalancedTransaction` and nothing it wrote is persisted. Otherwise the synthesized payers are erased and every other account is persisted exactly as executed.
+- If the shortfall exceeds the allowance, a pre-existing balance grew while the float was short, or more than 4 accounts were created while it was short, the transaction is failed with `UnbalancedTransaction` and nothing it wrote is persisted. Otherwise the synthesized payers are erased and every other account is persisted exactly as executed.
 
 Lamports sent *to* a synthesized payer are burned with it. Persisting the payer would graduate an address the channel invented into durable state, and returning them would mean rewriting the sender, so neither is safe. This is not a loss of deposited value: deposits mint tokens, never lamports, so every lamport in the channel began as a float or an admin mint's existence floor. It is also load-bearing for `CancelDvp`, where the settlement authority signs, pays, and receives the closed escrows' rent, ending above its float.
+
+Lamports that would bring a new System account into being are burned the same way, in every transaction, so no sequence of transactions can turn the float into a plain wallet. Ingress refuses every top-level System instruction, but a token `CloseAccount` or a DvP close can still pay lamports to an address the channel has never seen. That address is never created: if the float paid for it, the transaction fails with `UnbalancedTransaction`; if existing lamports paid for it, the transaction succeeds and they are burned.
 
 Because the SVM already enforces per-instruction lamport conservation, blocking the fabricated lamports at their source means every other balance is made of lamports that already existed, so no other account needs inspecting. Accounts a transaction merely carries as writable keys are never rewritten.
 
@@ -197,11 +218,11 @@ Batches execution results every 100ms (configurable) and commits to PostgreSQL, 
 
 The mirror is best-effort and covers only what the cache can serve: point lookups by pubkey, signature and slot, plus the chain tip. Ranges, history and counters are read from PostgreSQL, because a short answer from a partial mirror is indistinguishable from a complete one. A failed cache write drops the keys it would have updated so reads miss and resolve against PostgreSQL, and leaves the cached tip behind, which makes the next batch rebuild the cache. It is also bounded: a cache that has not answered within the budget is abandoned for that block, and one that keeps failing is left alone for a cooldown, then probed with a PING off the block path and rebuilt before it is mirrored to again.
 
-The settler also caps what it buffers between ticks: the settled account bytes, and the address-index rows the block will write, one per account key per transaction. Once a tick's buffer reaches either budget it stops draining the executor queue, so the executor's bounded send applies backpressure upstream rather than letting one commit grow without limit. Blocks are still produced only on the tick, never early, and the executor splits an oversized batch into byte-bounded messages so a single already-executed batch cannot overshoot the budget. The commit itself binds each column as one array parameter, so bounding the buffer is what bounds the bind; the driver is held at sqlx 0.8 or later, where an oversized bind fails loudly instead of being truncated by the binary protocol's length prefix.
+The settler also caps what it buffers between ticks: the settled account bytes, and the address-index rows the block will write, one per account key per transaction. Once a tick's buffer reaches either budget it stops draining the executor queue, so the executor's bounded send applies backpressure upstream rather than letting one commit grow without limit. A block that waits on an admission (see blockhash expiry above) drains the queue past the budget, so the queue itself is bounded too: the executor's in-flight budget weighs each message by its bytes or its address rows, whichever is more, and a full buffer plus that whole budget still fits the address-index writer. The rest of the admitted sub-batch also lands in that block; its rows fit at the default batch size, and in bytes the block can reach about 512 MiB, which a compile-time check keeps under Postgres' 1 GB limit for one bound value. Blocks are still produced only on the tick, never early, and the executor splits an oversized batch into byte-bounded messages so a single already-executed batch cannot overshoot the budget. The commit itself binds each column as one array parameter, so bounding the buffer is what bounds the bind; the driver is held at sqlx 0.8 or later, where an oversized bind fails loudly instead of being truncated by the binary protocol's length prefix.
 
-Both queues either side of the settler are bounded by the account bytes and index rows their messages carry, not only by how many messages are queued. The executor holds a byte budget for the results it has sent but the settler has not yet received, sized at two of its own chunks, and the settler holds a row budget for the address-index rows it has handed to the background writer but the writer has not yet folded into a flush. In each case the budget travels inside the message and comes back when the message is consumed or dropped, so no consumer has to account for it.
+Both queues either side of the settler are bounded by the account bytes and index rows their messages carry, not only by how many messages are queued. The executor holds a budget for the results it has sent but the settler has not yet received, sized at two of its own chunks and counting a message's address rows as well as its bytes, and the settler holds a row budget for the address-index rows it has handed to the background writer but the writer has not yet folded into a flush. In each case the budget travels inside the message and comes back when the message is consumed or dropped, so no consumer has to account for it.
 
-Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop. That acknowledgement is merged into a per-account inbox rather than sent on a queue, so it never blocks settlement: BOB drains it only while the executor runs and the executor runs only while the settler drains, so a blocking send would deadlock the three stages. Each account keeps only its newest settlement, which is all BOB can act on, so the inbox never holds more entries than BOB has dirty accounts. A settlement carries the generation of the executor write it made durable, not a mark for the whole block, so when the executor splits one batch across two messages and they land in different blocks, each account is still acknowledged for exactly the write that committed. It shares the account buffers BOB is already pinning rather than copying them, so its size costs metadata, not account data. The settled blockhash goes to dedup on a queue as deep as the blockhash window; dedup drains it even while its own forward to the sequencer is parked, so the settler only ever waits on it briefly.
+Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop. That acknowledgement is merged into a per-account inbox rather than sent on a queue, so it never blocks settlement: BOB drains it only while the executor runs and the executor runs only while the settler drains, so a blocking send would deadlock the three stages. Each account keeps only its newest settlement, which is all BOB can act on, so the inbox never holds more entries than BOB has dirty accounts. A settlement carries the generation of the executor write it made durable, not a mark for the whole block, so when the executor splits one batch across two messages and they land in different blocks, each account is still acknowledged for exactly the write that committed. It shares the account buffers BOB is already pinning rather than copying them, so its size costs metadata, not account data. The settler retires the hash each block expires from the dedup window itself, before it cuts the block, so the window keeps moving during a shutdown drain after dedup has stopped. The settled blockhash goes to dedup on a queue as deep as the blockhash window; dedup drains it even while its own forward to the sequencer is parked, so the settler only ever waits on it briefly.
 
 **Location**: [`core/src/stages/settle.rs`](../core/src/stages/settle.rs)
 
@@ -215,15 +236,21 @@ Solana Private Channels restricts which programs can execute in the payment chan
 | **SPL Token** | Supported | Token-2022 is **not** admitted at ingress; the escrow program on Mainnet accepts it, the channel does not |
 | **SPL Associated Token Account** | Supported | ATA creation and lookup |
 | **SPL Memo** | Supported | Memo attachments |
-| **System Program** | Supported | `Transfer` only; `CreateAccount`, `Allocate` and their seeded forms are rejected |
+| **System Program** | Not supported at top level | Every System instruction is refused at ingress, `Transfer` included; still reachable as a CPI target of the allowlisted programs |
 | **Solana Private Channels Withdraw Program** | Supported | Token burns for withdrawal flow |
 | **DvP Swap Program** | Supported | Delivery-versus-payment swaps |
+
+A transaction that lists the spl-token native mint (`So11111111111111111111111111111111111111112`) in its account keys is also rejected. spl-token builds a native (wSOL) account without loading the mint, so refusing the key is what keeps fabricated gasless lamports from becoming wSOL.
+
+A writable account other than the fee payer that no instruction is given, or only a Memo (which never writes), is rejected too (`-32602`, "Every writable account other than the fee payer must be passed to an instruction other than Memo"): the scheduler write-locks every writable key, so an unused one would serialize unrelated transactions on that account. A writable program, sysvar or other reserved key is rejected even when an instruction is given it (`-32602`, "Program, sysvar and other reserved accounts must not be writable"), since honest transactions read-lock those keys and would all serialize behind it.
 
 **Source**: [`is_allowed_program_instruction` in `core/src/transactions.rs`](../core/src/transactions.rs) (predicate), [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs) (enforcement)
 
 ### AdminVM Program Support
 
 The AdminVM (used for operator mint operations) only supports SPL Token `InitializeMint`. All other instruction types are rejected.
+
+An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidArgument`, a second guard behind the ingress check that refuses any transaction listing the native mint.
 
 **Source**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
 
@@ -258,6 +285,7 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Max loaded accounts data | 64 MB | [`core/src/processor.rs`](../core/src/processor.rs) |
 | Max signatures per `getSignatureStatuses` | 256 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max slot range for `getBlocks`, max limit for `getBlocksWithLimit` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max concurrent `getBlocks`/`getBlocksWithLimit` spanning more than 10,000 (a span counts only up to the newest block) | pool size / 8 (at least 1), the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max addresses per `simulateTransaction` | the transaction's own account count (matches Agave) | [`core/src/rpc/simulate_transaction_impl.rs`](../core/src/rpc/simulate_transaction_impl.rs) |
 | Max encoded bytes for `simulateTransaction` accounts | 5 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max concurrent `simulateTransaction` calls | 8, the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |

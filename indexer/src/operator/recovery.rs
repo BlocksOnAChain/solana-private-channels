@@ -685,7 +685,9 @@ async fn check_withdrawal(
                      recorded broadcast signature"
                 ),
             },
-            ReleaseVerdict::Uncertain(reason) => wait_or_escalate(row, nonce, reason),
+            ReleaseVerdict::Uncertain(reason) | ReleaseVerdict::Pending(reason) => {
+                wait_or_escalate(row, nonce, reason)
+            }
         };
     }
 
@@ -724,7 +726,9 @@ async fn check_withdrawal(
                          recorded signature is dead; the release landed under an unrecorded one"
                     ),
                 },
-                ReleaseVerdict::Uncertain(reason) => wait_or_escalate(row, nonce, reason),
+                ReleaseVerdict::Uncertain(reason) | ReleaseVerdict::Pending(reason) => {
+                    wait_or_escalate(row, nonce, reason)
+                }
             }
         }
         SigFinality::Live(reason) => WithdrawalAction::LeaveProcessing { reason },
@@ -754,7 +758,7 @@ async fn verified_release(
     let label = match &verdict {
         ReleaseVerdict::Landed { .. } => "landed",
         ReleaseVerdict::NotLanded => "not_landed",
-        ReleaseVerdict::Uncertain(_) => "uncertain",
+        ReleaseVerdict::Uncertain(_) | ReleaseVerdict::Pending(_) => "uncertain",
     };
     OPERATOR_RELEASE_VERIFY
         .with_label_values(&[site, label])
@@ -976,6 +980,7 @@ async fn route_outcome(
                         error_message: Some(reason),
                         remint_signature: None,
                         remint_attempted: false,
+                        alert_only: true,
                     };
                     // Closed channel = on-call alert lost; surface it loudly.
                     if let Err(e) =
@@ -1207,6 +1212,25 @@ mod tests {
             .create()
     }
 
+    /// A channel `getSignatureStatusSnapshot` reply: `status` is one JSON status or `null`.
+    fn mock_status_snapshot(
+        server: &mut mockito::ServerGuard,
+        status: &str,
+        height: u64,
+        floor: u64,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatusSnapshot""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":{{"blockHeight":{height},"firstAvailableBlock":{floor},"value":[{status}]}},"id":1}}"#
+            ))
+            .create()
+    }
+
     /// The keystone divergence from withdrawal: a deposit with no persisted signature is
     /// provably never broadcast (pre-broadcast persist), so it Demotes for a safe re-mint
     /// rather than Quarantining. No RPC is consulted.
@@ -1235,16 +1259,12 @@ mod tests {
     async fn deposit_landed_sig_completes_without_remint() {
         let landed_sig = Signature::new_unique();
         let mut server = mockito::Server::new_async().await;
-        let _status = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
-            ))
-            .with_status(200)
-            .with_body(
-                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
-            )
-            .create();
+        let _status = mock_status_snapshot(
+            &mut server,
+            r#"{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+            200,
+            0,
+        );
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
@@ -1264,11 +1284,8 @@ mod tests {
     #[tokio::test]
     async fn deposit_dead_sigs_demote() {
         let mut server = mockito::Server::new_async().await;
-        let _status = mock_null_status(&mut server);
-        // current_height (1000) > lvbh (100) means expired/dead.
-        let _height = mock_block_height(&mut server, 1000);
-        // Floor below the journaled blockhash slot: the absence is covered, so Dead stands.
-        let _floor = mock_ledger_floor(&mut server, 400);
+        // Expired (1000 > lvbh 100) and covered (floor 400 <= slot 500), so Dead stands.
+        let _snapshot = mock_status_snapshot(&mut server, "null", 1000, 400);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
@@ -1291,9 +1308,8 @@ mod tests {
     #[tokio::test]
     async fn deposit_live_sig_leaves_processing() {
         let mut server = mockito::Server::new_async().await;
-        let _status = mock_null_status(&mut server);
         // current_height (50) <= lvbh (1000) means still live.
-        let _height = mock_block_height(&mut server, 50);
+        let _snapshot = mock_status_snapshot(&mut server, "null", 50, 0);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
@@ -1898,6 +1914,7 @@ mod tests {
             update.error_message.as_deref(),
             Some("withdrawal row missing nonce")
         );
+        assert!(update.alert_only, "recovery already wrote the row");
     }
 
     /// A quarantined withdrawal must keep its release signatures on the row,

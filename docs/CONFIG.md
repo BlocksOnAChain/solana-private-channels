@@ -26,7 +26,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Tick interval (ms). A block is produced only when the tick carried transactions or the 1s idle heartbeat came due, and the slot it lands on counts every tick since the last block |
 | `--max-blockhashes` | `PRIVATE_CHANNEL_MAX_BLOCKHASHES` | `150` | How many **blocks** a blockhash stays valid for. Matches Solana's `MAX_PROCESSING_AGE`. Also the depth of the settled-blockhash queue from the settler to dedup |
 | `--transaction-expiration-ms` | `PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS` | none | **Deprecated.** Expiry as a duration. When set it overrides `--max-blockhashes` with `transaction_expiration_ms / blocktime_ms` and logs a warning. Removed after the next release |
-| `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 channel admin pubkeys, gating SPL `InitializeMint`. Not the escrow `Instance.admin`, which is a separate offline key |
+| `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 channel admin pubkeys, gating SPL `InitializeMint`, `MintTo`, `MintToChecked`, `FreezeAccount`, `ThawAccount`, mint-side `SetAuthority` and the withdraw program's `SetWithdrawConfig`. Not the escrow `Instance.admin`, which is a separate offline key |
 | `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string. Must be PostgreSQL: Redis is a cache, never the accounts database |
 | `--redis-cache-url` | `PRIVATE_CHANNEL_REDIS_CACHE_URL` | — | Optional Redis cache in front of the read path. Misses resolve against PostgreSQL |
 | `--redis-block-ttl-secs` | `PRIVATE_CHANNEL_REDIS_BLOCK_TTL_SECS` | `3600` | Expiry on cached `block:{slot}` entries, bounding cache growth. PostgreSQL is the source of truth, so an expired entry is a miss that re-reads. `0` disables it |
@@ -63,6 +63,9 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | `--write-url` | `GATEWAY_WRITE_URL` | — | Write node URL |
 | `--read-url` | `GATEWAY_READ_URL` | — | Read node URL |
 | `--cors-allowed-origin` | `GATEWAY_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
+| `--upstream-timeout-secs` | `GATEWAY_UPSTREAM_TIMEOUT_SECS` | `30` | Max seconds (1 to 3600) per request, from authorization (auth database and ownership fetch) until the response has been written to the client's socket. Past it the caller gets a 504, or, once the body has started, the connection is closed; either way the read slot, connection slot and upstream socket are released. It applies whether the node stalls or the client reads slowly or stops reading, so a slow client can show as `upstream_timeout` even when the node answered promptly |
+| `--max-forwarded-reads` | `GATEWAY_MAX_FORWARDED_READS` | `768` | Max public requests in flight to the read node; more are shed at once with a 503 and a closed connection, so writes keep free connection slots. Must be below `GATEWAY_MAX_CONNECTIONS` |
+| `--read-node-pg-max-connections` | `PRIVATE_CHANNEL_PG_MAX_CONNECTIONS` | `32` | The read node's Postgres pool size, read exactly as the read node reads it: unset, empty, unparseable or zero means 32, and values above 256 are clamped. Public `getBlocks` and `getBlocksWithLimit` calls the read node is still answering, of any span, are capped at a quarter of it (at least 1), and one client (an IPv4 address or an IPv6 /64) may hold at most a quarter of those slots until it has read its responses; more are shed at once with a 503 and a closed connection. Set it to the same value the read node gets: the shipped compose files pass the gateway the same variable. A gateway deployed without it assumes 32 |
 
 Routes `sendTransaction` and `isBlockhashValid` to the write node; all other RPC methods go to the read node.
 
@@ -224,5 +227,4 @@ shorter than `max_blockhashes` logs the shortfall at warn.
 |--------|-------------|
 | `scripts/ensure-operator-keypair.sh` | Generate operator keypair if missing |
 | `scripts/update-admin-env.sh` | Update `.env` with admin pubkey |
-| `scripts/reconcile-escrow-balance.sh` | Reconcile on-chain vs DB escrow balances (supports alert webhooks) |
 | `scripts/devnet/devnet-test.sh` | Full E2E test: instance creation through deposit/withdrawal/backfill validation |

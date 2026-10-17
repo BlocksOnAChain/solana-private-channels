@@ -62,6 +62,12 @@ async fn start_postgres(
     Ok((pool, storage, container))
 }
 
+/// The operator claims a deposit only once the escrow checkpoint covers its slot (100 in `make_db_transaction`).
+async fn cover_fixture_deposits(storage: &Storage) -> Result<(), Box<dyn std::error::Error>> {
+    storage.update_committed_checkpoint("escrow", 100).await?;
+    Ok(())
+}
+
 fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
     DbTransaction {
         id: 0,
@@ -593,16 +599,126 @@ async fn lock_pending_sets_processing() -> Result<(), Box<dyn std::error::Error>
 async fn lock_pending_second_call_empty() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
+    cover_fixture_deposits(&storage).await?;
     let txn = make_db_transaction("lock2", TransactionType::Deposit);
     storage.insert_db_transaction(&txn).await?;
 
-    let _ = storage
+    let first = storage
         .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
         .await?;
+    assert_eq!(first.len(), 1, "the first call claims the deposit");
+    assert_eq!(first[0].signature, "lock2");
     let second = storage
         .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
         .await?;
     assert!(second.is_empty());
+    Ok(())
+}
+
+/// A deposit above the escrow checkpoint stays Pending until the checkpoint covers its
+/// slot, so the mint gate never reads a history that a gap repair has not finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_claim_waits_for_escrow_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut txn = make_db_transaction("dep_106", TransactionType::Deposit);
+    txn.slot = 106;
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage.update_committed_checkpoint("escrow", 105).await?;
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    assert!(
+        locked.is_empty(),
+        "a deposit above the checkpoint is not claimed"
+    );
+    assert_eq!(status_of(&pool, id).await, "pending");
+
+    storage.update_committed_checkpoint("escrow", 106).await?;
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    assert_eq!(locked.len(), 1, "a covered deposit is claimed");
+    assert_eq!(locked[0].id, id);
+    Ok(())
+}
+
+/// Without an escrow checkpoint nothing proves the history is complete, so no deposit is
+/// claimed; a checkpoint row with no slot yet and another program's checkpoint count as none.
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_claim_needs_an_escrow_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_db_transaction(&make_db_transaction("dep_nocp", TransactionType::Deposit))
+        .await?;
+
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    assert!(locked.is_empty(), "no checkpoint row claims nothing");
+
+    storage
+        .update_committed_checkpoint("withdraw", 1_000)
+        .await?;
+    sqlx::query(
+        "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('escrow', NULL)",
+    )
+    .execute(&pool)
+    .await?;
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    assert!(
+        locked.is_empty(),
+        "a NULL escrow slot or a withdraw checkpoint claims nothing"
+    );
+    Ok(())
+}
+
+/// The checkpoint gate is deposit-only: a withdrawal far above any checkpoint is still claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_claim_ignores_escrow_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let mut txn = make_db_transaction("wd_far", TransactionType::Withdrawal);
+    txn.slot = 1_000_000;
+    storage.insert_db_transaction(&txn).await?;
+    storage.update_committed_checkpoint("escrow", 1).await?;
+
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    assert_eq!(
+        locked.len(),
+        1,
+        "withdrawals are not gated by the checkpoint"
+    );
+    Ok(())
+}
+
+/// Uncovered deposits are skipped, not locked, so they never use up the batch and a
+/// covered deposit behind them is still claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn uncovered_deposits_do_not_fill_the_batch() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    for i in 0..3 {
+        let mut txn = make_db_transaction(&format!("dep_live_{i}"), TransactionType::Deposit);
+        txn.slot = 200;
+        storage.insert_db_transaction(&txn).await?;
+    }
+    let mut old = make_db_transaction("dep_old", TransactionType::Deposit);
+    old.slot = 90;
+    let old_id = storage.insert_db_transaction(&old).await?;
+    storage.update_committed_checkpoint("escrow", 100).await?;
+
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 1)
+        .await?;
+    let ids: Vec<i64> = locked.iter().map(|txn| txn.id).collect();
+    assert_eq!(
+        ids,
+        vec![old_id],
+        "the covered deposit is claimed past the newer ones"
+    );
     Ok(())
 }
 
@@ -774,17 +890,19 @@ async fn upsert_mints_empty_ok() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string());
-    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string());
+    let fee_a = TokenAmount(1_000);
+    let fee_b = TokenAmount(2_500);
+    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string(), fee_a);
+    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string(), fee_b);
     storage.upsert_mints_batch(&[m1, m2]).await?;
 
-    let got_a = storage.get_mint("mint_a").await?;
-    assert!(got_a.is_some());
-    assert_eq!(got_a.unwrap().decimals, 6);
+    let got_a = storage.get_mint("mint_a").await?.unwrap();
+    assert_eq!(got_a.decimals, 6);
+    assert_eq!(got_a.withdraw_fee, fee_a);
 
-    let got_b = storage.get_mint("mint_b").await?;
-    assert!(got_b.is_some());
-    assert_eq!(got_b.unwrap().decimals, 9);
+    let got_b = storage.get_mint("mint_b").await?.unwrap();
+    assert_eq!(got_b.decimals, 9);
+    assert_eq!(got_b.withdraw_fee, fee_b);
 
     // Missing mint
     let got_c = storage.get_mint("mint_c").await?;
@@ -796,15 +914,146 @@ async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m = DbMint::new("mint_upd".to_string(), 6, "TokenkegQ".to_string());
+    let m = DbMint {
+        allow_mint_slot: 100,
+        ..DbMint::new(
+            "mint_upd".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[m]).await?;
 
-    // Upsert with new decimals
-    let m2 = DbMint::new("mint_upd".to_string(), 9, "TokenkegQ".to_string());
+    // Upsert with new decimals from a newer slot
+    let m2 = DbMint {
+        allow_mint_slot: 106,
+        ..DbMint::new(
+            "mint_upd".to_string(),
+            9,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[m2]).await?;
 
     let got = storage.get_mint("mint_upd").await?.unwrap();
     assert_eq!(got.decimals, 9);
+    Ok(())
+}
+
+/// A backfill or resync can write an older AllowMint after a newer one. The fee
+/// and minimum follow the AllowMint's slot, not the order the rows were written in.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let mint = "mint_allow_mint_slot";
+
+    let newer_fee = TokenAmount(10_000);
+    let newer_min_withdraw_amount = TokenAmount(50_000);
+    storage
+        .upsert_mints_batch(&[DbMint {
+            min_withdraw_amount: newer_min_withdraw_amount,
+            allow_mint_slot: 100,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), newer_fee)
+        }])
+        .await?;
+
+    // The replayed older AllowMint leaves the newer values and their slot alone.
+    storage
+        .upsert_mints_batch(&[DbMint {
+            min_withdraw_amount: TokenAmount(1),
+            allow_mint_slot: 90,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), TokenAmount(1))
+        }])
+        .await?;
+    let got = storage.get_mint(mint).await?.unwrap();
+    assert_eq!(got.withdraw_fee, newer_fee);
+    assert_eq!(got.min_withdraw_amount, newer_min_withdraw_amount);
+    assert_eq!(got.allow_mint_slot, 100);
+
+    // A later AllowMint still reprices both.
+    let repriced_fee = TokenAmount(20_000);
+    let repriced_min_withdraw_amount = TokenAmount(70_000);
+    storage
+        .upsert_mints_batch(&[DbMint {
+            min_withdraw_amount: repriced_min_withdraw_amount,
+            allow_mint_slot: 110,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), repriced_fee)
+        }])
+        .await?;
+    let got = storage.get_mint(mint).await?.unwrap();
+    assert_eq!(got.withdraw_fee, repriced_fee);
+    assert_eq!(got.min_withdraw_amount, repriced_min_withdraw_amount);
+    assert_eq!(got.allow_mint_slot, 110);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_profile_ignores_older_allow_mint() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let live_slot = 106;
+
+    let live = DbMint {
+        allow_mint_slot: live_slot,
+        ..DbMint::new(
+            "mint_live".to_string(),
+            9,
+            "TokenzQdB".to_string(),
+            TokenAmount(1),
+        )
+    };
+    storage.upsert_mints_batch(&[live]).await?;
+
+    // A gap repair delivering the older AllowMint after the live one.
+    let repaired = DbMint {
+        allow_mint_slot: 103,
+        ..DbMint::new(
+            "mint_live".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
+    storage.upsert_mints_batch(&[repaired]).await?;
+
+    let got = storage.get_mint("mint_live").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
+    assert_eq!(got.allow_mint_slot, live_slot);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_same_slot_later_profile_wins() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let slot = 106;
+
+    // A close and recreate between two AllowMints in one slot, in block order.
+    let first = DbMint {
+        allow_mint_slot: slot,
+        ..DbMint::new(
+            "mint_same".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
+    let second = DbMint {
+        allow_mint_slot: slot,
+        ..DbMint::new(
+            "mint_same".to_string(),
+            9,
+            "TokenzQdB".to_string(),
+            TokenAmount(1),
+        )
+    };
+    storage.upsert_mints_batch(&[first, second]).await?;
+
+    let got = storage.get_mint("mint_same").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
     Ok(())
 }
 
@@ -814,7 +1063,12 @@ async fn sync_mint_status_mirrors_history_against_postgres(
     let (_pool, storage, _pg) = start_postgres().await?;
 
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "sm".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
 
@@ -846,7 +1100,12 @@ async fn sync_mint_status_mirrors_history_against_postgres(
         .await?;
     storage.sync_mint_status(&["sm".to_string()]).await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "sm".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     assert_eq!(
         storage.get_mint("sm").await?.unwrap().status,
@@ -870,7 +1129,12 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     let mint = "recon_mint";
     let tp = "TokenkegQ";
     storage
-        .upsert_mints_batch(&[DbMint::new(mint.to_string(), 6, tp.to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            mint.to_string(),
+            6,
+            tp.to_string(),
+            TokenAmount(1),
+        )])
         .await?;
 
     // Pending deposit (ALL deposits count for reconciliation)
@@ -1222,6 +1486,9 @@ fn mk_status(mint: &str, status: &str, slot: i64, sig: &str) -> DbMintStatus {
         status: status.to_string(),
         withdrawals_blocked: false,
         effective_slot: slot,
+        transaction_index: 0,
+        instruction_index: 0,
+        inner_index: None,
         signature: sig.to_string(),
         created_at: Utc::now(),
     }
@@ -1243,7 +1510,7 @@ async fn insert_mint_statuses_batch_persists_rows_pg() -> Result<(), Box<dyn std
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn insert_mint_statuses_batch_idempotent_on_pk_conflict_pg(
+async fn insert_mint_statuses_batch_idempotent_on_source_conflict_pg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
     let row = mk_status("mint_pg2", "allowed", 100, "sig-1");
@@ -1323,6 +1590,288 @@ async fn get_mint_status_at_slot_returns_blocked_after_block_entry(
         .await?;
     let res = storage.get_mint_status_at_slot("mint_blk", 25).await?;
     assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+/// A deposit in the block's slot may have run before the block, so it passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_allowed_in_the_block_slot_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_same", "allowed", 10, "sig-a"),
+            mk_status("mint_same", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let res = storage
+        .get_mint_status_at_slot("mint_same", block_slot)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Allowed);
+    Ok(())
+}
+
+/// Blocked coming into the slot and no allow inside it: still blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_blocked_with_no_allow_in_or_before_the_slot_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_shut", "blocked", 10, "sig-a"),
+            mk_status("mint_shut", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let res = storage
+        .get_mint_status_at_slot("mint_shut", block_slot)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+/// The orphan query follows the gate: a deposit in the block's slot is not an orphan.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_passes_deposit_in_the_block_slot_pg() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_same", "allowed", 10, "sig-a"),
+            mk_status("mint_same", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let deposit = DbTransaction {
+        slot: block_slot,
+        mint: "mint_same".to_string(),
+        ..make_db_transaction("deposit_in_block_slot", TransactionType::Deposit)
+    };
+    storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "expected no orphans, got {ids:?}");
+    Ok(())
+}
+
+/// The mint's first allow and a deposit share a slot: the allow inside the slot
+/// clears it, with nothing allowed coming in.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_passes_deposit_in_the_first_allow_slot_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    let allow_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[mk_status("mint_new", "allowed", allow_slot, "sig-a")])
+        .await?;
+    let deposit = DbTransaction {
+        slot: allow_slot,
+        mint: "mint_new".to_string(),
+        ..make_db_transaction("deposit_in_allow_slot", TransactionType::Deposit)
+    };
+    storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "expected no orphans, got {ids:?}");
+    Ok(())
+}
+
+/// Blocked coming into the slot and only a block inside it: the deposit is an orphan.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_flags_deposit_with_only_blocks_in_its_slot_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_shut", "blocked", 10, "sig-a"),
+            mk_status("mint_shut", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let deposit = DbTransaction {
+        slot: block_slot,
+        mint: "mint_shut".to_string(),
+        ..make_db_transaction("deposit_in_block_slot", TransactionType::Deposit)
+    };
+    let deposit_id = storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert_eq!(ids, vec![deposit_id]);
+    Ok(())
+}
+
+/// A repair still owes the AllowMint at 103 while a live deposit at 106 is written. The
+/// orphan check waits for the checkpoint, so it does not flag the deposit early.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_waits_for_escrow_checkpoint_pg() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let deposit = DbTransaction {
+        slot: 106,
+        mint: "mint_gap".to_string(),
+        ..make_db_transaction("deposit_past_gap", TransactionType::Deposit)
+    };
+    let deposit_id = storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "no checkpoint judges no deposit: {ids:?}");
+
+    storage.update_committed_checkpoint("escrow", 100).await?;
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(
+        ids.is_empty(),
+        "an uncovered deposit is not an orphan yet: {ids:?}"
+    );
+
+    storage.update_committed_checkpoint("escrow", 106).await?;
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert_eq!(
+        ids,
+        vec![deposit_id],
+        "with the repair done and still no allow, it is an orphan"
+    );
+
+    storage
+        .insert_mint_statuses_batch(&[mk_status("mint_gap", "allowed", 103, "sig-gap")])
+        .await?;
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "the repaired allow clears it: {ids:?}");
+    Ok(())
+}
+
+/// Two changes in one slot are both kept and ordered by block position, not by
+/// insertion order, so the later transaction decides later slots and the mirror.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_slot_changes_are_both_kept_and_ordered_by_block_position_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            "mint_same".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
+        .await?;
+    let slot = 20;
+    let first_block = DbMintStatus {
+        transaction_index: 3,
+        ..mk_status("mint_same", "blocked", slot, "sig-b")
+    };
+    let allow = DbMintStatus {
+        transaction_index: 7,
+        ..mk_status("mint_same", "allowed", slot, "sig-c")
+    };
+    let second_block = DbMintStatus {
+        transaction_index: 5,
+        ..mk_status("mint_same", "blocked", slot, "sig-d")
+    };
+    // The winner sits in the middle, so neither the first nor the last inserted
+    // row can win a tie. Only the stored position picks it.
+    storage
+        .insert_mint_statuses_batch(&[first_block, allow, second_block])
+        .await?;
+    storage.sync_mint_status(&["mint_same".to_string()]).await?;
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mint_status_history WHERE mint_address = $1")
+            .bind("mint_same")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 3);
+    let res = storage
+        .get_mint_status_at_slot("mint_same", slot + 1)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Allowed);
+    let mint = storage.get_mint("mint_same").await?.unwrap();
+    assert_eq!(mint.status, "allowed");
+    Ok(())
+}
+
+/// AllowMint then BlockMint in one transaction, as the escrow guide allows: both
+/// rows are kept and the block, at the later instruction, decides.
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_then_block_in_one_transaction_ends_blocked_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            "mint_one_tx".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
+        .await?;
+    let slot = 20;
+    let signature = "sig-x";
+    let allow = DbMintStatus {
+        transaction_index: 4,
+        instruction_index: 0,
+        ..mk_status("mint_one_tx", "allowed", slot, signature)
+    };
+    let block = DbMintStatus {
+        transaction_index: 4,
+        instruction_index: 1,
+        ..mk_status("mint_one_tx", "blocked", slot, signature)
+    };
+    // The allow goes in first, so a tie won by the first row would read open.
+    storage.insert_mint_statuses_batch(&[allow, block]).await?;
+    storage
+        .sync_mint_status(&["mint_one_tx".to_string()])
+        .await?;
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mint_status_history WHERE mint_address = $1")
+            .bind("mint_one_tx")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 2);
+    let mint = storage.get_mint("mint_one_tx").await?.unwrap();
+    assert_eq!(mint.status, "blocked");
+    let res = storage
+        .get_mint_status_at_slot("mint_one_tx", slot + 1)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+/// The orphan query orders an earlier slot's changes by block position, like the
+/// gate: the allow in the middle is the status coming into the next slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_orders_an_earlier_slot_by_block_position_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    let slot = 20;
+    let first_block = DbMintStatus {
+        transaction_index: 3,
+        ..mk_status("mint_mixed", "blocked", slot, "sig-b")
+    };
+    let allow = DbMintStatus {
+        transaction_index: 7,
+        ..mk_status("mint_mixed", "allowed", slot, "sig-c")
+    };
+    let second_block = DbMintStatus {
+        transaction_index: 5,
+        ..mk_status("mint_mixed", "blocked", slot, "sig-d")
+    };
+    // The winner sits in the middle, so neither the first nor the last inserted
+    // row can win a tie. Only the stored position picks it.
+    storage
+        .insert_mint_statuses_batch(&[first_block, allow, second_block])
+        .await?;
+    let deposit = DbTransaction {
+        slot: slot + 1,
+        mint: "mint_mixed".to_string(),
+        ..make_db_transaction("deposit_after_mixed_slot", TransactionType::Deposit)
+    };
+    storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "expected no orphans, got {ids:?}");
     Ok(())
 }
 
@@ -1650,6 +2199,7 @@ async fn requeue_attempts_of(pool: &PgPool, id: i64) -> i32 {
 async fn try_requeue_processing_increments_recovery_counter(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let txn = make_db_transaction("requeue_counter", TransactionType::Deposit);
     let id = storage.insert_db_transaction(&txn).await?;
     // Lock flips Pending → Processing (and bumps updated_at via trigger).
@@ -1683,9 +2233,38 @@ async fn try_requeue_processing_increments_recovery_counter(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn try_fail_processing_refuses_an_earlier_incarnation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    let txn = make_db_transaction("fail_fence", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    let stale = updated_at_of(&pool, id).await;
+    assert!(storage.try_requeue_processing(id, stale).await?);
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+
+    assert!(
+        !storage.try_fail_processing(id, stale).await?,
+        "a lease from the earlier incarnation must not fail the row"
+    );
+    assert_eq!(status_of(&pool, id).await, "processing");
+
+    let current = updated_at_of(&pool, id).await;
+    assert!(storage.try_fail_processing(id, current).await?);
+    assert_eq!(status_of(&pool, id).await, "failed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let txn = make_db_transaction("requeue_stale", TransactionType::Deposit);
     let id = storage.insert_db_transaction(&txn).await?;
     storage
@@ -2035,20 +2614,29 @@ async fn try_requeue_prebroadcast_requeues_under_cap_then_caps(
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let first_lock = updated_at_of(&pool, id).await;
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 1).await?,
+        storage.try_requeue_prebroadcast(id, first_lock, 1).await?,
         RequeueOutcome::Requeued { attempts: 1 }
     );
     assert_eq!(status_of(&pool, id).await, "pending");
     assert_eq!(requeue_attempts_of(&pool, id).await, 1);
 
-    // At the cap (max 1, attempts 1): leave Processing, counter unchanged.
+    // At the cap (max 1, attempts 1): leave Processing, counter unchanged, but
+    // the write still bumps `updated_at` and hands back the new lease.
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let locked = updated_at_of(&pool, id).await;
+    let RequeueOutcome::AtCap { lease } = storage.try_requeue_prebroadcast(id, locked, 1).await?
+    else {
+        panic!("at the cap the write must report AtCap");
+    };
+    assert_ne!(lease, locked, "the capped write must bump updated_at");
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 1).await?,
-        RequeueOutcome::AtCap
+        lease,
+        updated_at_of(&pool, id).await,
+        "the lease must be the row's current updated_at"
     );
     assert_eq!(
         status_of(&pool, id).await,
@@ -2072,13 +2660,52 @@ async fn try_requeue_prebroadcast_not_processing_is_noop() -> Result<(), Box<dyn
     txn.withdrawal_nonce = Some(0);
     let id = storage.insert_db_transaction(&txn).await?;
 
-    // Never locked, so still Pending: the WHERE status = 'processing' finds no row.
+    // Never locked, so still Pending: the WHERE status = 'processing' finds no row,
+    // even with the row's own `updated_at` presented as the lease.
+    let current = updated_at_of(&pool, id).await;
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 3).await?,
+        storage.try_requeue_prebroadcast(id, current, 3).await?,
         RequeueOutcome::NotProcessing
     );
     assert_eq!(status_of(&pool, id).await, "pending");
     assert_eq!(requeue_attempts_of(&pool, id).await, 0);
+    Ok(())
+}
+
+/// A lease from an earlier incarnation matches nothing, at the cap included, so
+/// a stale attempt neither requeues the row nor bumps the claim it now holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_prebroadcast_refuses_an_earlier_incarnation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut txn = make_db_transaction("prebroadcast_stale", TransactionType::Withdrawal);
+    txn.withdrawal_nonce = Some(0);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    let stale = updated_at_of(&pool, id).await;
+    assert!(storage.try_requeue_processing(id, stale).await?);
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    let current = updated_at_of(&pool, id).await;
+
+    for max_attempts in [3, 1] {
+        assert_eq!(
+            storage
+                .try_requeue_prebroadcast(id, stale, max_attempts)
+                .await?,
+            RequeueOutcome::NotProcessing,
+            "a stale lease must match nothing (max_attempts {max_attempts})"
+        );
+    }
+    assert_eq!(status_of(&pool, id).await, "processing");
+    assert_eq!(
+        updated_at_of(&pool, id).await,
+        current,
+        "the current claim must survive"
+    );
     Ok(())
 }
 
@@ -2091,6 +2718,7 @@ async fn try_requeue_prebroadcast_not_processing_is_noop() -> Result<(), Box<dyn
 #[tokio::test(flavor = "multi_thread")]
 async fn lock_returns_processing_era_updated_at() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let id = storage
         .insert_db_transaction(&make_db_transaction("lock_token", TransactionType::Deposit))
         .await?;
@@ -2123,6 +2751,7 @@ async fn lock_returns_processing_era_updated_at() -> Result<(), Box<dyn std::err
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let id = storage
         .insert_db_transaction(&make_db_transaction(
             "claim_atomic",
@@ -2179,6 +2808,7 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_is_refused_while_halted() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let id = storage
         .insert_db_transaction(&make_db_transaction(
             "claim_halted",
@@ -2219,6 +2849,7 @@ async fn claim_is_refused_while_halted() -> Result<(), Box<dyn std::error::Error
 #[tokio::test(flavor = "multi_thread")]
 async fn halted_claim_requeues_only_an_unsent_row() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let lock = |sig: &'static str| {
         let storage = &storage;
         let pool = &pool;
@@ -2285,6 +2916,7 @@ async fn halted_claim_requeues_only_an_unsent_row() -> Result<(), Box<dyn std::e
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_dedups_signature_on_conflict() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let id = storage
         .insert_db_transaction(&make_db_transaction(
             "claim_dedup",
@@ -3523,7 +4155,12 @@ async fn seed_both_sides(
     .execute(pool)
     .await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("mint_addr".to_string(), 6, "token".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "mint_addr".to_string(),
+            6,
+            "token".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     storage
         .insert_mint_statuses_batch(&[mk_status("mint_addr", "allowed", 1, "allow-sig")])

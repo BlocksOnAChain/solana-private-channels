@@ -18,7 +18,8 @@ use std::str::FromStr;
 use tracing::warn;
 
 use crate::db::{
-    is_wallet_owned_by_user, owned_wallets, owner_change_indexed_from, owner_changes, OwnerChange,
+    is_wallet_owned_by_user, owned_wallets, owner_chain, OwnerChain, OwnerChange,
+    OwnerChangeCoverage,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,7 +63,15 @@ pub struct Claims {
 
 /// Methods that require a valid JWT with the Operator role.
 /// Callers without a token receive 401; callers with a User-role JWT receive 403.
-const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulateTransaction"];
+/// `getSignatureStatusSnapshot` returns raw errors and opens a DB transaction, so operators only.
+/// `getAddressIndexSlot` is channel internals only resync needs, via the internal listener.
+const OPERATOR_ONLY_METHODS: &[&str] = &[
+    "getBlock",
+    "getTransaction",
+    "simulateTransaction",
+    "getSignatureStatusSnapshot",
+    "getAddressIndexSlot",
+];
 
 /// Methods that require a valid JWT. For User-role callers an ownership check
 /// is also performed (the requested pubkey must be in their verified wallets).
@@ -182,12 +191,24 @@ const MINT_END: usize = 32;
 const OWNER_OFFSET: usize = 32;
 const OWNER_END: usize = 64;
 
+/// Byte range of the `amount` field: the balance in base units, a u64 LE.
+const AMOUNT_OFFSET: usize = 64;
+const AMOUNT_END: usize = 72;
+
 /// Byte offset of the `delegate` Option discriminant (u32 LE: 0=None, 1=Some).
 const DELEGATE_OPTION_OFFSET: usize = 72;
 
 /// Byte range of the `delegate` field, only valid when bytes [72..76] == [1,0,0,0].
 const DELEGATE_OFFSET: usize = 76;
 const DELEGATE_END: usize = 108;
+
+/// Byte offset of the `state` field; 0 is Uninitialized.
+const STATE_OFFSET: usize = 108;
+const STATE_UNINITIALIZED: u8 = 0;
+
+/// Byte range of the `delegated_amount` field: the delegate's allowance, a u64 LE.
+const DELEGATED_AMOUNT_OFFSET: usize = 121;
+const DELEGATED_AMOUNT_END: usize = 129;
 
 // ---------------------------------------------------------------------------
 // DvP swap escrow program
@@ -320,12 +341,78 @@ pub async fn check_account_data_ownership(
     }
 }
 
+/// Whether who may read the account is decided by its own bytes, which can
+/// change between the gateway's check and the node's answer. A wallet's reader
+/// is decided by its address, which cannot.
+pub fn authority_is_in_account_data(program_owner: &str) -> bool {
+    matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
+        || program_owner == DVP_SWAP_PROGRAM.as_str()
+}
+
+/// The balance a token account's bytes hold, or `None` if they are not a token
+/// account.
+pub fn token_account_amount(data: &[u8], program_owner: &str) -> Option<u64> {
+    if !matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
+        || data.len() < TOKEN_ACCOUNT_SIZE
+    {
+        return None;
+    }
+    let amount: [u8; 8] = data[AMOUNT_OFFSET..AMOUNT_END].try_into().ok()?;
+    Some(u64::from_le_bytes(amount))
+}
+
+/// A `dataSlice`, read the way the node's `UiDataSliceConfig` reads one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataSlice {
+    pub offset: usize,
+    pub length: usize,
+}
+
+/// The slice a `getAccountInfo` for a token or swap account asks for, or the
+/// body to refuse it with.
+///
+/// The gateway forwards these as whole base64 and cuts the reply itself, so the
+/// node never sees the caller's config and cannot refuse a malformed one. This
+/// refuses what the node would. Base58 and binary are refused too: the node
+/// refuses them for any account this large, and a cut small enough to encode
+/// is not worth re-encoding here.
+pub fn requested_data_slice(params: &Value) -> Result<Option<DataSlice>, Bytes> {
+    let config = match params.get(1) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(config)) => config,
+        Some(_) => return Err(malformed_account_config_body()),
+    };
+
+    match config.get("encoding") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(encoding)) => match encoding.as_str() {
+            "base64" | "base64+zstd" | "jsonParsed" => {}
+            "base58" | "binary" => return Err(base58_account_body()),
+            _ => return Err(malformed_account_config_body()),
+        },
+        Some(_) => return Err(malformed_account_config_body()),
+    }
+
+    let slice = match config.get("dataSlice") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(slice) => slice,
+    };
+    let offset = slice.get("offset").and_then(Value::as_u64);
+    let length = slice.get("length").and_then(Value::as_u64);
+    match (
+        offset.and_then(|offset| usize::try_from(offset).ok()),
+        length.and_then(|length| usize::try_from(length).ok()),
+    ) {
+        (Some(offset), Some(length)) => Ok(Some(DataSlice { offset, length })),
+        _ => Err(malformed_account_config_body()),
+    }
+}
+
 /// Whether `pubkey` is still the associated token account its own `owner` field
 /// derives to.
 ///
-/// A user's token accounts are all ATAs: the ingress allowlist limits System to
-/// `Transfer`, so `CreateAccount` is unreachable and only the ATA program can
-/// make them. An ATA's address is derived from the wallet that owned it at
+/// A user's token accounts are all ATAs: the ingress allowlist refuses System,
+/// so `CreateAccount` is unreachable and only the ATA program can make them. An ATA's address is derived from the wallet that owned it at
 /// creation, and nothing rewrites the address afterwards. So an owner the
 /// address no longer derives to is proof the owner field was moved, whatever
 /// moved it, including a CPI this gateway never sees.
@@ -360,16 +447,26 @@ const MAX_OWNER_CHANGES: i64 = 64;
 
 /// The slot ranges `user_id` may read `pubkey`'s history for.
 ///
-/// `None` means no filtering: the address never changed hands, so all of it is
-/// theirs. `Some(ranges)` keeps only entries whose slot falls inside one of
-/// them, and an empty `Some` hides the page entirely.
+/// `None` means no filtering, which any non-token account gets: its readers
+/// cannot change. `Some(ranges)` keeps only entries whose slot falls inside one
+/// of them, and an empty `Some` hides the page entirely.
 ///
-/// Only a token account can change hands; a wallet address is its own identity
-/// for as long as it exists, so it never needs a range.
+/// A token account can change hands, so its windows end at the ledger tip read
+/// in the same snapshot as its chain. The chain holds every handoff up to that
+/// tip, so a handoff after it, which the node may already show when it serves
+/// the page, is outside every window.
+///
+/// They also end no later than `fetched_slot`, the slot ownership was checked
+/// at. The node reads `data` at or after it, so a handoff that left no row and
+/// landed by then shows in those bytes. The cost is freshness: a read node
+/// behind the tip holds back the newest signatures until it catches up. On the
+/// node's Redis path a cache miss reads the replica behind it, which can be
+/// older than the slot, so there the cap narrows that gap without closing it.
 pub async fn resolve_owned_slot_ranges(
     data: &[u8],
     program_owner: &str,
     pubkey: &str,
+    fetched_slot: u64,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> Result<Option<Vec<(i64, i64)>>, sqlx::Error> {
@@ -387,16 +484,27 @@ pub async fn resolve_owned_slot_ranges(
         return Ok(Some(Vec::new()));
     };
 
-    // Handoffs are only recorded from this slot on. Below it an empty table
-    // means the rows were not being written yet, not that nothing happened.
-    let Some(indexed_from) = owner_change_indexed_from(auth_db).await? else {
-        warn!("Ledger records no owner-change watermark; serving no history for {pubkey}");
-        record_scope_outcome("no_watermark");
+    let Ok(checked_at) = i64::try_from(fetched_slot) else {
+        warn!("Ownership of {pubkey} was checked at slot {fetched_slot}, past any ledger slot; serving no history");
+        record_scope_outcome("no_coverage");
         return Ok(Some(Vec::new()));
     };
 
-    // One past the cap, so a full page is how an over-long chain announces itself.
-    let changes = owner_changes(auth_db, &address, MAX_OWNER_CHANGES + 1).await?;
+    // The coverage and the chain in one snapshot, so the chain holds every
+    // handoff up to the tip whichever server answers the history query. One
+    // past the cap, so a full page is how an over-long chain announces itself.
+    let OwnerChain { coverage, changes } =
+        owner_chain(auth_db, &address, MAX_OWNER_CHANGES + 1).await?;
+    let Some(coverage) = coverage else {
+        warn!("Ledger records no owner-change watermark or tip; serving no history for {pubkey}");
+        record_scope_outcome("no_coverage");
+        return Ok(Some(Vec::new()));
+    };
+    let coverage = OwnerChangeCoverage {
+        tip: coverage.tip.min(checked_at),
+        ..coverage
+    };
+
     if changes.is_empty() {
         // No row is only evidence of no handoff while the address still derives
         // from its owner. An owner it does not derive to was moved without one
@@ -407,13 +515,17 @@ pub async fn resolve_owned_slot_ranges(
             record_scope_outcome("unrecorded_handoff");
             return Ok(Some(Vec::new()));
         }
-        // A ledger recorded from genesis can vouch for the whole history.
-        if indexed_from == 0 {
+        // Never handed on, so every slot the chain vouches for is theirs.
+        let ranges = clip_to_coverage(vec![(0, i64::MAX)], coverage);
+        if ranges.is_empty() {
+            warn!("No slot of {pubkey} is vouched for yet: the watermark is past the cap");
+            record_scope_outcome("no_window");
+        } else if coverage.indexed_from == 0 {
             record_scope_outcome("never_handed_on");
-            return Ok(None);
+        } else {
+            record_scope_outcome("watermarked");
         }
-        record_scope_outcome("watermarked");
-        return Ok(Some(vec![(indexed_from, i64::MAX)]));
+        return Ok(Some(ranges));
     }
     // Past the cap what we hold is a suffix of the timeline. Every window inside
     // it is still accounted for by the handoffs on either side of it, so the cap
@@ -440,12 +552,10 @@ pub async fn resolve_owned_slot_ranges(
     let owned = owned_wallets(auth_db, user_id, &candidates).await?;
 
     let current_owner = bs58::encode(&data[OWNER_OFFSET..OWNER_END]).into_string();
-    let ranges = slot_ranges_for_owner(&changes, &current_owner, &owned, chain_is_complete)
-        .into_iter()
-        .filter_map(|(first, last)| {
-            (last >= indexed_from).then_some((first.max(indexed_from), last))
-        })
-        .collect::<Vec<_>>();
+    let ranges = clip_to_coverage(
+        slot_ranges_for_owner(&changes, &current_owner, &owned, chain_is_complete),
+        coverage,
+    );
 
     if ranges.is_empty() {
         // Either the chain did not account for the current owner, or none of
@@ -460,6 +570,20 @@ pub async fn resolve_owned_slot_ranges(
     }
 
     Ok(Some(ranges))
+}
+
+/// Clip `ranges` to the slots the chain vouches for: none below the watermark,
+/// where handoffs were not recorded yet, and none above the tip, where one may
+/// have landed since. A window left empty is dropped.
+fn clip_to_coverage(ranges: Vec<(i64, i64)>, coverage: OwnerChangeCoverage) -> Vec<(i64, i64)> {
+    ranges
+        .into_iter()
+        .filter_map(|(first, last)| {
+            let first = first.max(coverage.indexed_from);
+            let last = last.min(coverage.tip);
+            (first <= last).then_some((first, last))
+        })
+        .collect()
 }
 
 /// Rebuild an address's ownership timeline from its handoffs and keep the
@@ -523,9 +647,9 @@ fn slot_ranges_for_owner(
 
 /// Ownership check for SPL Token and Token-2022 accounts. Both programs share
 /// the same base layout, so this checks the `owner` field (bytes 32-63) and,
-/// if it doesn't match, the `delegate` field (bytes 76-107) when present. The
-/// delegate grants read access for a current-state method, but is skipped for
-/// an `OWNER_ONLY_METHODS` one.
+/// if it doesn't match, the `delegate` field (bytes 76-107) when present with a
+/// nonzero allowance on an initialized account. The delegate grants read access
+/// for a current-state method, but is skipped for an `OWNER_ONLY_METHODS` one.
 ///
 /// Mints are owned by the same programs but are only 82 bytes, below
 /// `TOKEN_ACCOUNT_SIZE`; they are not user accounts and are denied.
@@ -555,9 +679,14 @@ async fn check_token_account_ownership(
         return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
     }
 
-    // Check the `delegate` field if one is set.
+    // Check the `delegate` field if one is set, the account is initialized and the
+    // allowance is nonzero. Approve(delegate, 0) leaves the delegate set with
+    // nothing to spend, so it must not keep read access.
     // Bytes 72-75 == [1, 0, 0, 0] means the Option<Pubkey> is Some.
-    if data[DELEGATE_OPTION_OFFSET..DELEGATE_OPTION_OFFSET + 4] == [1, 0, 0, 0] {
+    if data[DELEGATE_OPTION_OFFSET..DELEGATE_OPTION_OFFSET + 4] == [1, 0, 0, 0]
+        && data[STATE_OFFSET] != STATE_UNINITIALIZED
+        && data[DELEGATED_AMOUNT_OFFSET..DELEGATED_AMOUNT_END] != [0; 8]
+    {
         let delegate = bs58::encode(&data[DELEGATE_OFFSET..DELEGATE_END]).into_string();
 
         match is_wallet_owned_by_user(auth_db, user_id, &delegate).await {
@@ -702,6 +831,26 @@ pub fn auth_unavailable_body() -> Bytes {
     )
 }
 
+/// 400 body for a token or swap account asked for as base58 or binary.
+fn base58_account_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32602, "message": "Invalid params: token and swap accounts cannot be served as base58 or binary" }
+        })
+        .to_string(),
+    )
+}
+
+/// 400 body for a `getAccountInfo` config the node would refuse.
+fn malformed_account_config_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32602, "message": "Invalid params: malformed getAccountInfo config" }
+        })
+        .to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,6 +971,44 @@ mod tests {
     fn operator_only_operator_role_proceeds() {
         let decision = check_request_auth(Some(&claims(Role::Operator)), "getBlock", &json!([]));
         assert!(matches!(decision, AuthDecision::Proceed));
+    }
+
+    /// The snapshot carries raw execution errors and opens a database transaction per call.
+    #[test]
+    fn signature_status_snapshot_is_operator_only() {
+        let method = "getSignatureStatusSnapshot";
+        assert!(is_gated(method));
+        assert!(matches!(
+            check_request_auth(None, method, &json!([])),
+            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::User)), method, &json!([])),
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::Operator)), method, &json!([])),
+            AuthDecision::Proceed
+        ));
+    }
+
+    /// Resync reads index progress through the internal listener, so nothing
+    /// outside the operator's own services needs it on the public one.
+    #[test]
+    fn address_index_slot_is_operator_only() {
+        let method = "getAddressIndexSlot";
+        assert!(matches!(
+            check_request_auth(None, method, &json!([])),
+            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::User)), method, &json!([])),
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::Operator)), method, &json!([])),
+            AuthDecision::Proceed
+        ));
     }
 
     #[test]

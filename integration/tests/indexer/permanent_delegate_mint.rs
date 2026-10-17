@@ -47,6 +47,8 @@ use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::time::Duration;
+use test_utils::channel_shim::ChannelShim;
+use test_utils::mint_helper::TEST_WITHDRAW_FEE;
 use test_utils::operator_helper::start_private_channel_to_solana_operator;
 use test_utils::validator_helper::start_test_validator_no_geyser;
 use testcontainers::runners::AsyncRunner;
@@ -223,6 +225,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         mint_pubkey.to_string(),
         MINT_DECIMALS as i16,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
@@ -231,6 +234,9 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_pubkey}"),
             created_at: Utc::now(),
         }])
@@ -246,9 +252,11 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
     // Start the withdraw operator.
+    // The validator has no status snapshot, so the operator reads the channel through this.
+    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
-        test_validator.rpc_url(),
+        channel_shim.url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         instance_pda,
@@ -388,6 +396,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
         mint_pubkey.to_string(),
         MINT_DECIMALS as i16,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
@@ -396,6 +405,9 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_pubkey}"),
             created_at: Utc::now(),
         }])
@@ -412,9 +424,11 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
     );
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
+    // The validator has no status snapshot, so the operator reads the channel through this.
+    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
-        test_validator.rpc_url(),
+        channel_shim.url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         instance_pda,

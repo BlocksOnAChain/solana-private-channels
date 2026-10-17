@@ -6,6 +6,7 @@ pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_signature;
 pub mod claim_remint_attempt;
 pub mod close;
+pub mod count_pending_remint_transactions;
 pub mod count_pending_transactions;
 pub mod delete_release_signature;
 pub mod delete_release_signatures;
@@ -53,6 +54,7 @@ pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_complete_stalled_withdrawal;
+pub mod try_fail_processing;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -220,7 +222,7 @@ impl Storage {
     }
 
     /// Append Allow/Block transition rows to `mint_status_history`.
-    /// Idempotent on (mint_address, effective_slot)
+    /// Idempotent on the source instruction (signature, instruction_index, inner_index).
     pub async fn insert_mint_statuses_batch(
         &self,
         statuses: &[DbMintStatus],
@@ -297,11 +299,18 @@ impl Storage {
 
     /// Per-mint sum of every unsettled transaction amount (pending / processing /
     /// parked / pending_remint), used as the in-flight envelope by the runtime
-    /// reconciliation halt decision.
+    /// reconciliation halt decision, plus settled rows above each type's bound.
     pub async fn get_in_flight_amounts_by_mint(
         &self,
+        deposits_after: Option<u64>,
+        withdrawals_after: Option<u64>,
     ) -> Result<Vec<MintInFlightAmount>, StorageError> {
-        get_in_flight_amounts_by_mint::get_in_flight_amounts_by_mint(self).await
+        get_in_flight_amounts_by_mint::get_in_flight_amounts_by_mint(
+            self,
+            deposits_after,
+            withdrawals_after,
+        )
+        .await
     }
 
     /// Set the durable reconciliation halt flag. Idempotent.
@@ -342,8 +351,9 @@ impl Storage {
         get_serviced_rows::get_serviced_rows(self, own, after_id, limit).await
     }
 
-    /// `transactions.id` for every `deposit` row whose mint was not in
-    /// `allowed` status at the deposit's slot, per `mint_status_history`.
+    /// `transactions.id` for every `deposit` row whose mint was not allowed
+    /// coming into the deposit's slot or by a change inside it, per
+    /// `mint_status_history`.
     ///
     /// A non-empty result means the indexer recorded a deposit for a mint
     /// that was either never allowlisted or was blocked at the time of the
@@ -464,12 +474,23 @@ impl Storage {
         record_remint_result::record_remint_result(self, transaction_id, remint_signature).await
     }
 
-    /// Returns all withdrawal transactions in PendingRemint status.
-    /// Called on startup to re-hydrate the remint queue after a crash.
+    /// Counts PendingRemint withdrawals with `id > after_id`, the backlog not yet loaded.
+    pub async fn count_pending_remint_transactions(
+        &self,
+        after_id: i64,
+    ) -> Result<i64, StorageError> {
+        count_pending_remint_transactions::count_pending_remint_transactions(self, after_id).await
+    }
+
+    /// Returns one page of PendingRemint withdrawals with `id > after_id`, oldest id first.
+    /// The sender loads its remint queue page by page, so memory stays bounded.
     pub async fn get_pending_remint_transactions(
         &self,
+        after_id: i64,
+        limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_pending_remint_transactions::get_pending_remint_transactions(self).await
+        get_pending_remint_transactions::get_pending_remint_transactions(self, after_id, limit)
+            .await
     }
 
     /// Current status of one row, or `None` if it does not exist. Used to
@@ -572,15 +593,22 @@ impl Storage {
         requeue_halted_claim::requeue_halted_claim(self, transaction_id, expected_updated_at).await
     }
 
-    /// Cap-gated CAS `Processing` → `Pending` for sender-side pre-broadcast failures
-    /// where the sender owns the Processing row. Enforces the requeue cap inside the
-    /// write; see `RequeueOutcome`.
+    /// Cap-gated CAS `Processing` → `Pending` on `updated_at` for pre-broadcast
+    /// failures, so only the incarnation the caller owns is requeued or capped.
+    /// Enforces the requeue cap inside the write; see `RequeueOutcome`.
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
         max_attempts: i32,
     ) -> Result<RequeueOutcome, StorageError> {
-        try_requeue_prebroadcast::try_requeue_prebroadcast(self, transaction_id, max_attempts).await
+        try_requeue_prebroadcast::try_requeue_prebroadcast(
+            self,
+            transaction_id,
+            expected_updated_at,
+            max_attempts,
+        )
+        .await
     }
 
     /// CAS `Processing`/`Parked` → `Parked`; `Ok(false)` if the row is neither.
@@ -641,6 +669,15 @@ impl Storage {
             release_signatures,
         )
         .await
+    }
+
+    /// CAS `Processing` → `Failed` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_fail_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_fail_processing::try_fail_processing(self, transaction_id, expected_updated_at).await
     }
 
     /// CAS a stalled withdrawal (`ManualReview` or `PendingRemint`) to
@@ -928,6 +965,7 @@ mod tests {
     #[tokio::test]
     async fn get_and_lock_marks_processing_and_leaves_pending() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         {
             let mut pending = mock.pending_transactions.lock().unwrap();
             for i in 0..3 {
@@ -969,6 +1007,53 @@ mod tests {
             1,
             "only the remaining Pending deposit re-locks"
         );
+    }
+
+    /// Mirrors the Postgres gate: deposits wait for the escrow checkpoint, withdrawals never do.
+    #[tokio::test]
+    async fn get_and_lock_deposits_waits_for_escrow_checkpoint() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            let mut dep = make_db_transaction();
+            dep.signature = "dep_106".to_string();
+            dep.slot = 106;
+            pending.push(dep);
+            let mut w = make_db_transaction();
+            w.transaction_type = TransactionType::Withdrawal;
+            w.signature = "wd_far".to_string();
+            w.slot = 1_000_000;
+            pending.push(w);
+        }
+
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert!(locked.is_empty(), "no checkpoint claims no deposit");
+
+        mock.set_checkpoint("escrow", 105);
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert!(
+            locked.is_empty(),
+            "a deposit above the checkpoint stays Pending"
+        );
+
+        mock.set_checkpoint("escrow", 106);
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert_eq!(locked.len(), 1, "a covered deposit is claimed");
+
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+            .await
+            .unwrap();
+        assert_eq!(locked.len(), 1, "withdrawals ignore the escrow checkpoint");
     }
 
     /// The resolved dequeue has no nonce frontier and orders by `created_at`.
@@ -1039,7 +1124,10 @@ mod tests {
             "the authoritative row carries the on-chain refusal"
         );
 
-        let rehydrated = storage.get_pending_remint_transactions().await.unwrap();
+        let rehydrated = storage
+            .get_pending_remint_transactions(0, i64::MAX)
+            .await
+            .unwrap();
         assert_eq!(rehydrated.len(), 1);
         assert!(
             rehydrated[0].release_refused_on_chain,
@@ -1384,8 +1472,18 @@ mod tests {
 
         storage
             .upsert_mints_batch(&[
-                DbMint::new("mint_1".to_string(), 6, TOKEN_PROGRAM.to_string()),
-                DbMint::new("mint_2".to_string(), 9, TOKEN_PROGRAM.to_string()),
+                DbMint::new(
+                    "mint_1".to_string(),
+                    6,
+                    TOKEN_PROGRAM.to_string(),
+                    TokenAmount(1),
+                ),
+                DbMint::new(
+                    "mint_2".to_string(),
+                    9,
+                    TOKEN_PROGRAM.to_string(),
+                    TokenAmount(1),
+                ),
             ])
             .await
             .unwrap();
@@ -1474,7 +1572,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_upsert_mints_batch_via_mock() {
         let (storage, mock) = make_mock_storage();
-        let mint = DbMint::new("test_mint".to_string(), 6, TOKEN_PROGRAM.to_string());
+        let mint = DbMint::new(
+            "test_mint".to_string(),
+            6,
+            TOKEN_PROGRAM.to_string(),
+            TokenAmount(1),
+        );
         storage.upsert_mints_batch(&[mint]).await.unwrap();
         assert!(mock.mints.lock().unwrap().contains_key("test_mint"));
     }
@@ -1483,7 +1586,12 @@ mod tests {
     async fn sync_mint_status_mirrors_latest_history_and_preserves_metadata() {
         let (storage, _mock) = make_mock_storage();
         storage
-            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .upsert_mints_batch(&[DbMint::new(
+                "m1".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
             .await
             .unwrap();
 
@@ -1520,7 +1628,12 @@ mod tests {
     async fn sync_mint_status_ignores_older_history_after_block() {
         let (storage, _mock) = make_mock_storage();
         storage
-            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .upsert_mints_batch(&[DbMint::new(
+                "m1".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
             .await
             .unwrap();
         storage
@@ -1539,7 +1652,7 @@ mod tests {
         );
     }
 
-    /// The withdrawal gate rides the same slot-ordered history as `status`, which
+    /// The withdrawal gate rides the same position-ordered history as `status`, which
     /// is what stops a replayed BlockMint from reopening it. The withdrawal
     /// pre-flight reads the mirrored column per withdrawal, so this is the query
     /// that decides whether a blocked mint actually stops releasing.
@@ -1547,7 +1660,12 @@ mod tests {
     async fn sync_mint_status_mirrors_the_withdrawal_gate_independently() {
         let (storage, _mock) = make_mock_storage();
         storage
-            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .upsert_mints_batch(&[DbMint::new(
+                "m1".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
             .await
             .unwrap();
 
@@ -1559,6 +1677,9 @@ mod tests {
                 status: "allowed".to_string(),
                 withdrawals_blocked: true,
                 effective_slot: 20,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: "sig-block-withdrawals".to_string(),
                 created_at: Utc::now(),
             }])
@@ -1578,6 +1699,9 @@ mod tests {
                 status: "allowed".to_string(),
                 withdrawals_blocked: false,
                 effective_slot: 30,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: "sig-reallow".to_string(),
                 created_at: Utc::now(),
             }])
@@ -1610,7 +1734,12 @@ mod tests {
     async fn dispatch_get_mint_via_mock() {
         let (storage, _mock) = make_mock_storage();
         // Populate with mints
-        let mint = DbMint::new("mint_1".to_string(), 6, TOKEN_PROGRAM.to_string());
+        let mint = DbMint::new(
+            "mint_1".to_string(),
+            6,
+            TOKEN_PROGRAM.to_string(),
+            TokenAmount(1),
+        );
         storage
             .upsert_mints_batch(std::slice::from_ref(&mint))
             .await
@@ -1998,6 +2127,9 @@ mod tests {
                 mint_address: mint.clone(),
                 status: "allowed".to_string(),
                 effective_slot: 100,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: "sig-1".to_string(),
                 created_at: Utc::now(),
             }])
@@ -2012,7 +2144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_mint_statuses_batch_idempotent_on_pk_conflict() {
+    async fn insert_mint_statuses_batch_idempotent_on_source_conflict() {
         use std::sync::Arc;
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
@@ -2021,6 +2153,9 @@ mod tests {
             mint_address: mint.clone(),
             status: "allowed".to_string(),
             effective_slot: 100,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: "sig-1".to_string(),
             created_at: Utc::now(),
         };
@@ -2058,6 +2193,9 @@ mod tests {
             mint_address: mint.to_string(),
             status: status.to_string(),
             effective_slot: slot,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("sig-{mint}-{slot}"),
             created_at: Utc::now(),
         }
@@ -2167,26 +2305,93 @@ mod tests {
         assert_eq!(res, MintStatusAtSlot::Allowed);
     }
 
-    /// Accepted limitation: a same-slot allow + block can't both be stored — PK
-    /// `(mint_address, effective_slot)` with `ON CONFLICT DO NOTHING` and no
-    /// intra-slot tiebreak, so the first inserted wins. Rare (admin-only); pinned
-    /// here so it can't change silently. Allow inserted first → block dropped.
+    /// A deposit in the block's slot may have run before the block, so it passes.
     #[tokio::test]
-    async fn get_mint_status_at_slot_same_slot_allow_then_block_keeps_first_inserted() {
+    async fn get_mint_status_at_slot_returns_allowed_in_the_block_slot() {
         let (storage, _mock) = make_mock_storage();
+        let block_slot = 20;
         storage
             .insert_mint_statuses_batch(&[
                 status_row("mint_a", "allowed", 10),
-                status_row("mint_a", "blocked", 10),
+                status_row("mint_a", "blocked", block_slot),
             ])
             .await
             .unwrap();
-        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
-        assert_eq!(
-            res,
-            MintStatusAtSlot::Allowed,
-            "first-inserted row wins on a same-slot conflict; the block is dropped",
-        );
+        let res = storage
+            .get_mint_status_at_slot("mint_a", block_slot)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    /// Blocked coming into the slot and no allow inside it: still blocked.
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_blocked_with_no_allow_in_or_before_the_slot() {
+        let (storage, _mock) = make_mock_storage();
+        let block_slot = 20;
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "blocked", 10),
+                status_row("mint_a", "blocked", block_slot),
+            ])
+            .await
+            .unwrap();
+        let res = storage
+            .get_mint_status_at_slot("mint_a", block_slot)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Blocked);
+    }
+
+    /// Two changes in one slot are both kept and ordered by block position, not by
+    /// insertion order, so the later transaction decides later slots and the mirror.
+    #[tokio::test]
+    async fn same_slot_changes_are_both_kept_and_ordered_by_block_position() {
+        let (storage, mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new(
+                "mint_a".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
+            .await
+            .unwrap();
+        let slot = 20;
+        let first_block = DbMintStatus {
+            transaction_index: 3,
+            signature: "sig-b".to_string(),
+            ..status_row("mint_a", "blocked", slot)
+        };
+        let allow = DbMintStatus {
+            transaction_index: 7,
+            signature: "sig-c".to_string(),
+            ..status_row("mint_a", "allowed", slot)
+        };
+        let second_block = DbMintStatus {
+            transaction_index: 5,
+            signature: "sig-d".to_string(),
+            ..status_row("mint_a", "blocked", slot)
+        };
+        // The winner sits in the middle, so neither the first nor the last inserted
+        // row can win a tie. Only the stored position picks it.
+        storage
+            .insert_mint_statuses_batch(&[first_block, allow, second_block])
+            .await
+            .unwrap();
+        storage
+            .sync_mint_status(&["mint_a".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(mock.mint_status_history.lock().unwrap().len(), 3);
+        let res = storage
+            .get_mint_status_at_slot("mint_a", slot + 1)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+        let mint = storage.get_mint("mint_a").await.unwrap().unwrap();
+        assert_eq!(mint.status, "allowed");
     }
 
     // ── orphan query against status history ──────────────────────────
@@ -2225,6 +2430,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_query_flags_deposit_before_mint_allowed() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         seed_deposit(&mock, 1, "mint_a", 5);
         storage
             .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
@@ -2237,6 +2443,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_query_passes_deposit_at_or_after_allow() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         seed_deposit(&mock, 1, "mint_a", 10);
         seed_deposit(&mock, 2, "mint_a", 15);
         storage
@@ -2250,6 +2457,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_query_flags_deposit_during_blocked_window() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         seed_deposit(&mock, 7, "mint_a", 25);
         storage
             .insert_mint_statuses_batch(&[
@@ -2260,6 +2468,24 @@ mod tests {
             .unwrap();
         let ids = storage.get_orphan_deposit_ids().await.unwrap();
         assert_eq!(ids, vec![7]);
+    }
+
+    /// A deposit above the escrow checkpoint may sit past history a repair still owes, so it
+    /// is judged only once the checkpoint covers it.
+    #[tokio::test]
+    async fn orphan_query_waits_for_escrow_checkpoint() {
+        let (storage, mock) = make_mock_storage();
+        seed_deposit(&mock, 1, "mint_a", 106);
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert!(ids.is_empty(), "no checkpoint judges no deposit");
+
+        mock.set_checkpoint("escrow", 100);
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert!(ids.is_empty(), "an uncovered deposit is not an orphan yet");
+
+        mock.set_checkpoint("escrow", 106);
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert_eq!(ids, vec![1], "a covered deposit with no allow is an orphan");
     }
 
     #[tokio::test]
@@ -2608,7 +2834,10 @@ mod tests {
                 TransactionStatus::ManualReview,
             ));
         }
-        let rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        let rows = storage
+            .get_in_flight_amounts_by_mint(None, None)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].mint_address, "mint_a");
         assert_eq!(rows[0].in_flight_amount, BigDecimal::from(1500u64));
@@ -2627,7 +2856,10 @@ mod tests {
                 TransactionStatus::Processing,
             ));
         }
-        let mut rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        let mut rows = storage
+            .get_in_flight_amounts_by_mint(None, None)
+            .await
+            .unwrap();
         rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].mint_address, "mint_a");
@@ -2640,9 +2872,135 @@ mod tests {
     async fn in_flight_empty_is_absent() {
         let (storage, _mock) = make_mock_storage();
         assert!(storage
-            .get_in_flight_amounts_by_mint()
+            .get_in_flight_amounts_by_mint(None, None)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn sloted_txn(
+        id: i64,
+        kind: TransactionType,
+        status: TransactionStatus,
+        slot: i64,
+        amount: u64,
+    ) -> DbTransaction {
+        let mut t = in_flight_txn(id, "mint_a", amount, status);
+        t.transaction_type = kind;
+        t.slot = slot;
+        t
+    }
+
+    /// (in_flight, adjustment) for mint_a under the given bounds.
+    async fn envelope_parts(
+        storage: &Storage,
+        deposits_after: Option<u64>,
+        withdrawals_after: Option<u64>,
+    ) -> (BigDecimal, BigDecimal) {
+        let rows = storage
+            .get_in_flight_amounts_by_mint(deposits_after, withdrawals_after)
+            .await
+            .unwrap();
+        rows.into_iter()
+            .find(|r| r.mint_address == "mint_a")
+            .map(|r| (r.in_flight_amount, r.adjustment_amount))
+            .unwrap_or_default()
+    }
+
+    /// Terminal rows count only strictly above their own type's bound, and an in-flight row
+    /// above a bound is still counted once, as in-flight.
+    #[tokio::test]
+    async fn envelope_adds_terminal_rows_above_each_types_bound() {
+        use TransactionStatus::*;
+        use TransactionType::*;
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(sloted_txn(1, Deposit, Completed, 1_000, 1));
+            db.push(sloted_txn(2, Deposit, Completed, 1_001, 2));
+            db.push(sloted_txn(3, Deposit, Failed, 1_002, 4));
+            db.push(sloted_txn(4, Withdrawal, Completed, 10, 8));
+            db.push(sloted_txn(5, Withdrawal, ManualReview, 11, 16));
+            // Above the deposit bound but a withdrawal, whose bound it is below.
+            db.push(sloted_txn(6, Withdrawal, Completed, 5_000, 32));
+            db.push(sloted_txn(7, Deposit, Processing, 2_000, 64));
+        }
+        let (in_flight, adjustment) = envelope_parts(&storage, Some(1_000), Some(10)).await;
+        assert_eq!(in_flight, BigDecimal::from(64u64));
+        assert_eq!(adjustment, BigDecimal::from(2u64 + 4 + 16 + 32));
+
+        // Raising the withdrawal bound drops every withdrawal, leaving the deposits.
+        let (_, adjustment) = envelope_parts(&storage, Some(1_000), Some(5_000)).await;
+        assert_eq!(adjustment, BigDecimal::from(2u64 + 4));
+    }
+
+    /// A missing bound skips its arm instead of counting that type's whole history.
+    #[tokio::test]
+    async fn envelope_without_a_bound_skips_that_arm() {
+        use TransactionStatus::*;
+        use TransactionType::*;
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(sloted_txn(1, Deposit, Completed, 1, 1));
+            db.push(sloted_txn(2, Withdrawal, Completed, 1, 2));
+        }
+        let zero = BigDecimal::from(0u64);
+        assert_eq!(envelope_parts(&storage, None, None).await.1, zero);
+        assert_eq!(
+            envelope_parts(&storage, Some(0), None).await.1,
+            BigDecimal::from(1u64)
+        );
+        assert_eq!(
+            envelope_parts(&storage, None, Some(0)).await.1,
+            BigDecimal::from(2u64)
+        );
+        assert_eq!(
+            envelope_parts(&storage, Some(u64::MAX), Some(u64::MAX))
+                .await
+                .1,
+            zero
+        );
+    }
+
+    /// Every status is either in the envelope or counted by the slot arms; a new status
+    /// must be classified here before this compiles.
+    #[tokio::test]
+    async fn every_status_is_counted_exactly_once_above_the_bound() {
+        use TransactionStatus::*;
+        fn in_envelope(status: TransactionStatus) -> bool {
+            match status {
+                Pending | Processing | Parked | PendingRemint => true,
+                Completed | Failed | FailedReminted | ManualReview => false,
+            }
+        }
+        let all = [
+            Pending,
+            Processing,
+            Parked,
+            PendingRemint,
+            Completed,
+            Failed,
+            FailedReminted,
+            ManualReview,
+        ];
+        for (i, status) in all.into_iter().enumerate() {
+            for kind in [TransactionType::Deposit, TransactionType::Withdrawal] {
+                let (storage, mock) = make_mock_storage();
+                mock.pending_transactions
+                    .lock()
+                    .unwrap()
+                    .push(sloted_txn(i as i64, kind, status, 50, 7));
+                let (in_flight, adjustment) = envelope_parts(&storage, Some(10), Some(10)).await;
+                let seven = BigDecimal::from(7u64);
+                let zero = BigDecimal::from(0u64);
+                let expected = if in_envelope(status) {
+                    (seven, zero)
+                } else {
+                    (zero, seven)
+                };
+                assert_eq!((in_flight, adjustment), expected, "{status:?} {kind:?}");
+            }
+        }
     }
 }

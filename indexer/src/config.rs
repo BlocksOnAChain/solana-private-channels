@@ -8,7 +8,6 @@ use solana_transaction_status::UiTransactionEncoding;
 use crate::indexer::datasource::common::parser::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
-use crate::operator::SignerUtil;
 use crate::storage::common::models::TransactionType;
 
 /// Program type to index
@@ -129,6 +128,147 @@ pub fn floor_operator_commitment(level: CommitmentLevel) -> Result<CommitmentLev
     }
 }
 
+/// Largest `batch_size` for any batch of RPC block reads; the request deadline is sized for this.
+pub const MAX_RPC_BATCH_SIZE: usize = 100;
+
+/// Rejects a batch size that is zero (the backfill never advances) or larger than the
+/// request deadline was sized for.
+pub fn validate_rpc_batch_size(field: &str, batch_size: usize) -> Result<(), String> {
+    if batch_size == 0 {
+        return Err(format!(
+            "{field} must be greater than 0: a zero batch reads no blocks and never advances"
+        ));
+    }
+    if batch_size > MAX_RPC_BATCH_SIZE {
+        return Err(format!(
+            "{field} = {batch_size} exceeds {MAX_RPC_BATCH_SIZE}: every RPC request has a fixed \
+             deadline sized for a batch of at most {MAX_RPC_BATCH_SIZE} blocks, so a larger batch \
+             would time out on every retry"
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects an ingestion encoding the block decoder cannot read. The decoder only handles
+/// `json`, so any other value makes every block fail and the poller retry one slot forever.
+pub fn validate_rpc_encoding(field: &str, encoding: UiTransactionEncoding) -> Result<(), String> {
+    if encoding != UiTransactionEncoding::Json {
+        return Err(format!(
+            "{field} = {encoding:?} is not supported: the block decoder only reads json"
+        ));
+    }
+    Ok(())
+}
+
+/// Trim an optional owned config string, treating blank/whitespace as unset.
+pub fn normalize_optional(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Names a config key by its TOML path and its env var, since either can set it.
+fn zero_error(key: &str, env: &str) -> String {
+    format!("{key} ({env}) must be greater than 0")
+}
+
+impl PostgresConfig {
+    /// Rejects a zero pool size, which panics in sqlx pool creation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_connections == 0 {
+            return Err(zero_error(
+                "storage.max_connections",
+                "STORAGE_MAX_CONNECTIONS",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Startup rules for an operator, shared by the binary (before storage opens) and
+/// `operator::run` (for library callers). Pure: touches no storage and no network.
+/// Floors on the intervals are a deployment choice and live in the binary only.
+pub fn validate_operator_startup(
+    common: &PrivateChannelIndexerConfig,
+    config: &OperatorConfig,
+) -> Result<(), String> {
+    // Both roles use the source chain: withdraw remints there, escrow reads custody from it.
+    // A blank value passes `is_some` but fails the RPC client at the first use.
+    if normalized(&common.source_rpc_url).is_none() {
+        return Err(
+            "common.source_rpc_url (COMMON_SOURCE_RPC_URL) required for every operator: the \
+             withdraw remint and the escrow custody read both target the source chain"
+                .to_string(),
+        );
+    }
+    // Both roles are bound to one instance: withdraw derives the bitmap and ReleaseFunds
+    // accounts from it, escrow reconciles its custody.
+    if common.escrow_instance_id.is_none() {
+        return Err(
+            "common.escrow_instance_id (COMMON_ESCROW_INSTANCE_ID) required for every operator: \
+             withdraw releases and escrow reconciliation are bound to the instance"
+                .to_string(),
+        );
+    }
+    let zero_checks = [
+        (
+            config.db_poll_interval.is_zero(),
+            "operator.poll_interval_secs",
+            "OPERATOR_POLL_INTERVAL_SECS",
+        ),
+        (
+            config.batch_size == 0,
+            "operator.batch_size",
+            "OPERATOR_BATCH_SIZE",
+        ),
+        (
+            config.retry_max_attempts == 0,
+            "operator.retry_max_attempts",
+            "OPERATOR_RETRY_MAX_ATTEMPTS",
+        ),
+        (
+            config.retry_base_delay.is_zero(),
+            "operator.retry_base_delay_secs",
+            "OPERATOR_RETRY_BASE_DELAY_SECS",
+        ),
+        (
+            config.channel_buffer_size == 0,
+            "operator.channel_buffer_size",
+            "OPERATOR_CHANNEL_BUFFER_SIZE",
+        ),
+        (
+            config.reconciliation_interval.is_zero(),
+            "operator.reconciliation_interval_secs",
+            "OPERATOR_RECONCILIATION_INTERVAL_SECS",
+        ),
+        (
+            config.feepayer_monitor_interval.is_zero(),
+            "operator.feepayer_monitor_interval_secs",
+            "OPERATOR_FEEPAYER_MONITOR_INTERVAL_SECS",
+        ),
+        (
+            config.confirmation_poll_interval_ms == 0,
+            "operator.confirmation_poll_interval_ms",
+            "OPERATOR_CONFIRMATION_POLL_INTERVAL_MS",
+        ),
+    ];
+    for (is_zero, key, env) in zero_checks {
+        if is_zero {
+            return Err(zero_error(key, env));
+        }
+    }
+    // Without a sink the insolvency halt still fires but its alert is silently dropped.
+    // Presence only: a placeholder URL is the operator's choice.
+    if common.program_type == ProgramType::Escrow
+        && normalized(&config.reconciliation_webhook_url).is_none()
+    {
+        return Err(
+            "operator.reconciliation_webhook_url (OPERATOR_RECONCILIATION_WEBHOOK_URL) required \
+             for the escrow operator: a halt must have somewhere to alert"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Backfill configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackfillConfig {
@@ -181,6 +321,7 @@ impl PrivateChannelIndexerConfig {
     /// Indexer rules only. The operator needs `escrow_instance_id` for both program types
     /// and enforces that in `operator::run`, so it never calls this.
     pub fn validate(&self) -> Result<(), String> {
+        self.postgres.validate()?;
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {
                 return Err("--escrow-instance-id required when program_type is Escrow".to_string())
@@ -265,10 +406,11 @@ pub struct ReconciliationConfig {
     /// risk. This also removes the old race-window false positive where a deposit landed in
     /// the ATA before the DB query observed it.
     pub mismatch_threshold_raw: u64,
-    /// Relative shortfall tolerated on top of `mismatch_threshold_raw`, in basis points of
-    /// on-chain custody. The runtime liability check applies the same formula, so set this
-    /// to the operator's `reconciliation_tolerance_bps` to make the two agree. 0 (default)
-    /// leaves `mismatch_threshold_raw` as the only bound.
+    /// Relative shortfall, or channel supply above custody, tolerated on top of
+    /// `mismatch_threshold_raw`, in basis points of on-chain custody. The runtime liability
+    /// check applies the same formula, so set this to the operator's
+    /// `reconciliation_tolerance_bps` to make the two agree. 0 (default) leaves
+    /// `mismatch_threshold_raw` as the only bound.
     #[serde(default)]
     pub reconciliation_tolerance_bps: u16,
 }
@@ -328,6 +470,43 @@ impl IndexerConfig {
             return Err("backfill.backfill_only requires backfill.enabled to be true".to_string());
         }
 
+        // Yellowstone builds a gap poller from the same section, so check it whenever present.
+        if let Some(rpc_polling) = &self.rpc_polling {
+            validate_rpc_encoding(
+                "indexer.rpc_polling.encoding (INDEXER_RPC_POLLING_ENCODING)",
+                rpc_polling.encoding,
+            )?;
+            if rpc_polling.poll_interval_ms == 0 {
+                return Err(zero_error(
+                    "indexer.rpc_polling.poll_interval_ms",
+                    "INDEXER_RPC_POLLING_POLL_INTERVAL_MS",
+                ));
+            }
+            if rpc_polling.error_retry_interval_ms == 0 {
+                return Err(zero_error(
+                    "indexer.rpc_polling.error_retry_interval_ms",
+                    "INDEXER_RPC_POLLING_ERROR_RETRY_INTERVAL_MS",
+                ));
+            }
+        }
+
+        // Each batch size is checked only where it feeds RPC batches. Yellowstone gap repair
+        // fills with the backfill batch size even when backfill itself is off.
+        if self.datasource_type == DatasourceType::RpcPolling {
+            if let Some(rpc_polling) = &self.rpc_polling {
+                validate_rpc_batch_size(
+                    "indexer.rpc_polling.batch_size (INDEXER_RPC_POLLING_BATCH_SIZE)",
+                    rpc_polling.batch_size,
+                )?;
+            }
+        }
+        if self.backfill.enabled || self.datasource_type == DatasourceType::Yellowstone {
+            validate_rpc_batch_size(
+                "indexer.backfill.batch_size (INDEXER_BACKFILL_BATCH_SIZE)",
+                self.backfill.batch_size,
+            )?;
+        }
+
         Ok(())
     }
 }
@@ -342,7 +521,7 @@ impl IndexerConfig {
 /// - `ADMIN_SIGNER`: Signer type (memory|vault|turnkey|privy)
 /// - `ADMIN_PRIVATE_KEY`: Private key or key identifier
 ///
-/// ## Optional (falls back to admin if not set):
+/// ## Optional (admin is used only when OPERATOR_SIGNER is unset; a set but broken one fails startup):
 /// - `OPERATOR_SIGNER`: Signer type for operator-specific operations
 /// - `OPERATOR_PRIVATE_KEY`: Private key or key identifier for operator
 ///
@@ -386,10 +565,10 @@ pub struct OperatorConfig {
     /// Tolerance threshold in basis points (100 bps = 1%)
     #[serde(default = "default_reconciliation_tolerance")]
     pub reconciliation_tolerance_bps: u16,
-    /// Webhook URL for reconciliation alerts (optional). Carries both balance
-    /// mismatch alerts and orphan deposit alerts.
+    /// Webhook URL for reconciliation alerts. Required and non-blank for the escrow
+    /// operator, ignored by withdraw. Carries both balance mismatch and orphan deposit alerts.
     pub reconciliation_webhook_url: Option<String>,
-    /// How often to check the feepayer SOL balance (escrow operators only)
+    /// How often to check the feepayer SOL balance (withdraw operators only)
     #[serde(default = "default_feepayer_monitor_interval")]
     pub feepayer_monitor_interval: std::time::Duration,
     /// Milliseconds between `getSignatureStatuses` polls when confirming a sent transaction.
@@ -418,20 +597,6 @@ fn default_feepayer_monitor_interval() -> std::time::Duration {
 
 fn default_confirmation_poll_interval_ms() -> u64 {
     DEFAULT_CONFIRMATION_POLL_INTERVAL_MS
-}
-
-impl OperatorConfig {
-    /// Validate that required signers are configured
-    ///
-    /// This triggers lazy initialization of signers and will fail fast
-    /// if required environment variables are missing or invalid.
-    pub fn validate_signers() -> Result<(), String> {
-        let _ = SignerUtil::get_admin_pubkey();
-
-        let _ = SignerUtil::get_operator_pubkey();
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -745,6 +910,332 @@ mod tests {
 
         config.backfill.enabled = true;
         assert!(config.validate().is_ok(), "the enabled pair must validate");
+    }
+
+    /// Every batch fed to the RPC poller is capped, and the error names the deadline as the reason.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_rpc_batches_above_the_ceiling() {
+        let mut live = create_indexer_config();
+        live.rpc_polling.as_mut().unwrap().batch_size = MAX_RPC_BATCH_SIZE + 1;
+        let mut backfill = create_indexer_config();
+        backfill.backfill.batch_size = MAX_RPC_BATCH_SIZE + 1;
+
+        for (field, config) in [
+            ("indexer.rpc_polling.batch_size", live),
+            ("indexer.backfill.batch_size", backfill),
+        ] {
+            let err = config
+                .validate()
+                .expect_err("a batch above the ceiling must not validate");
+            assert!(err.contains(field), "error must name {field}, got: {err}");
+            assert!(
+                err.contains("deadline"),
+                "error must give the reason, got: {err}"
+            );
+        }
+    }
+
+    /// A batch size no RPC batch can use does not block startup; the one gap repair uses still does.
+    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
+    #[test]
+    fn validate_checks_each_batch_size_only_where_it_is_used() {
+        let mut polling = create_indexer_config();
+        polling.backfill.enabled = false;
+        polling.backfill.batch_size = MAX_RPC_BATCH_SIZE + 1;
+        assert!(
+            polling.validate().is_ok(),
+            "backfill is off and the live poller ignores its batch size"
+        );
+
+        let mut streaming = create_indexer_config();
+        streaming.datasource_type = DatasourceType::Yellowstone;
+        streaming.yellowstone = Some(YellowstoneConfig {
+            endpoint: "http://localhost:10000".to_string(),
+            x_token: None,
+            commitment: "finalized".to_string(),
+        });
+        streaming.rpc_polling.as_mut().unwrap().batch_size = MAX_RPC_BATCH_SIZE + 1;
+        assert!(
+            streaming.validate().is_ok(),
+            "the Yellowstone datasource never runs the live poller"
+        );
+
+        streaming.backfill.enabled = false;
+        streaming.backfill.batch_size = MAX_RPC_BATCH_SIZE + 1;
+        let err = streaming
+            .validate()
+            .expect_err("gap repair reads the backfill batch size even with backfill off");
+        assert!(err.contains("indexer.backfill.batch_size"), "got: {err}");
+    }
+
+    /// The defaults and the ceiling itself are accepted.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_accepts_rpc_batches_up_to_the_ceiling() {
+        let mut config = create_indexer_config();
+        assert!(config.validate().is_ok(), "the defaults must validate");
+
+        config.rpc_polling.as_mut().unwrap().batch_size = MAX_RPC_BATCH_SIZE;
+        config.backfill.batch_size = MAX_RPC_BATCH_SIZE;
+        assert!(
+            config.validate().is_ok(),
+            "the ceiling itself must validate"
+        );
+    }
+
+    // ── zero and unsupported values refused at startup ───────────────────
+
+    #[test]
+    fn rpc_batch_size_zero_is_refused_with_its_own_message() {
+        let err = validate_rpc_batch_size("indexer.backfill.batch_size", 0)
+            .expect_err("a zero batch never advances");
+        assert!(err.contains("indexer.backfill.batch_size"), "got: {err}");
+        assert!(err.contains("greater than 0"), "got: {err}");
+        assert!(validate_rpc_batch_size("x", 1).is_ok());
+    }
+
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_zero_batch_sizes_where_they_are_used() {
+        let mut live = create_indexer_config();
+        live.rpc_polling.as_mut().unwrap().batch_size = 0;
+        let mut backfill = create_indexer_config();
+        backfill.backfill.batch_size = 0;
+        for (field, config) in [
+            ("indexer.rpc_polling.batch_size", live),
+            ("indexer.backfill.batch_size", backfill),
+        ] {
+            let err = config
+                .validate()
+                .expect_err("a zero batch size must not validate");
+            assert!(err.contains(field), "error must name {field}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn only_json_encoding_is_accepted() {
+        for encoding in [
+            UiTransactionEncoding::JsonParsed,
+            UiTransactionEncoding::Base64,
+            UiTransactionEncoding::Base58,
+            UiTransactionEncoding::Binary,
+        ] {
+            let err = validate_rpc_encoding("indexer.rpc_polling.encoding", encoding)
+                .expect_err("the decoder only reads json");
+            assert!(err.contains("indexer.rpc_polling.encoding"), "got: {err}");
+        }
+        assert!(
+            validate_rpc_encoding("indexer.rpc_polling.encoding", UiTransactionEncoding::Json)
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_a_non_json_encoding_and_names_the_env_var() {
+        let mut config = create_indexer_config();
+        config.rpc_polling.as_mut().unwrap().encoding = UiTransactionEncoding::JsonParsed;
+        let err = config.validate().expect_err("jsonParsed must not validate");
+        assert!(err.contains("INDEXER_RPC_POLLING_ENCODING"), "got: {err}");
+    }
+
+    /// Yellowstone builds a gap poller from the same field, so the encoding is checked
+    /// whenever the section is present, not only for the polling datasource.
+    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
+    #[test]
+    fn validate_rejects_a_non_json_encoding_under_yellowstone() {
+        let mut config = create_indexer_config();
+        config.datasource_type = DatasourceType::Yellowstone;
+        config.yellowstone = Some(YellowstoneConfig {
+            endpoint: "http://localhost:10000".to_string(),
+            x_token: None,
+            commitment: "finalized".to_string(),
+        });
+        config.rpc_polling.as_mut().unwrap().encoding = UiTransactionEncoding::Base64;
+        let err = config
+            .validate()
+            .expect_err("the gap poller shares the encoding");
+        assert!(err.contains("indexer.rpc_polling.encoding"), "got: {err}");
+    }
+
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_zero_poller_intervals() {
+        let mut poll = create_indexer_config();
+        poll.rpc_polling.as_mut().unwrap().poll_interval_ms = 0;
+        let mut retry = create_indexer_config();
+        retry.rpc_polling.as_mut().unwrap().error_retry_interval_ms = 0;
+        for (field, config) in [
+            ("indexer.rpc_polling.poll_interval_ms", poll),
+            ("indexer.rpc_polling.error_retry_interval_ms", retry),
+        ] {
+            let err = config.validate().expect_err("a zero interval busy-loops");
+            assert!(err.contains(field), "error must name {field}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn postgres_pool_size_zero_is_refused() {
+        let mut pg = create_common_config().postgres;
+        pg.max_connections = 0;
+        let err = pg.validate().expect_err("a zero pool panics in sqlx");
+        assert!(err.contains("storage.max_connections"), "got: {err}");
+        assert!(err.contains("STORAGE_MAX_CONNECTIONS"), "got: {err}");
+        pg.max_connections = 1;
+        assert!(pg.validate().is_ok());
+    }
+
+    #[test]
+    fn indexer_common_validate_refuses_a_zero_pool() {
+        let mut common = create_common_config();
+        common.postgres.max_connections = 0;
+        let err = common.validate().expect_err("a zero pool must be refused");
+        assert!(err.contains("STORAGE_MAX_CONNECTIONS"), "got: {err}");
+    }
+
+    #[test]
+    fn normalize_optional_drops_blanks_and_trims() {
+        assert_eq!(normalize_optional(None), None);
+        assert_eq!(normalize_optional(Some("  \t".to_string())), None);
+        assert_eq!(
+            normalize_optional(Some(" http://x \n".to_string())),
+            Some("http://x".to_string())
+        );
+    }
+
+    fn operator_fixture(
+        program_type: ProgramType,
+    ) -> (PrivateChannelIndexerConfig, OperatorConfig) {
+        let mut common = create_common_config();
+        common.program_type = program_type;
+        let operator = OperatorConfig {
+            db_poll_interval: std::time::Duration::from_secs(1),
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay: std::time::Duration::from_secs(1),
+            channel_buffer_size: 100,
+            rpc_commitment: CommitmentLevel::Confirmed,
+            alert_webhook_url: None,
+            reconciliation_interval: std::time::Duration::from_secs(300),
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url: Some("http://alerts.local/hook".to_string()),
+            feepayer_monitor_interval: std::time::Duration::from_secs(60),
+            confirmation_poll_interval_ms: 250,
+        };
+        (common, operator)
+    }
+
+    #[test]
+    fn operator_startup_accepts_a_valid_config_for_both_roles() {
+        for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+            let (common, operator) = operator_fixture(role);
+            validate_operator_startup(&common, &operator).expect("a valid config must pass");
+        }
+    }
+
+    /// Each zero would panic, busy-loop or quarantine rows. The error names the TOML key
+    /// and the env var because compose can set either.
+    #[test]
+    fn operator_startup_rejects_each_zero_value() {
+        type Mutate = fn(&mut OperatorConfig);
+        let cases: [(&str, &str, Mutate); 8] = [
+            (
+                "operator.poll_interval_secs",
+                "OPERATOR_POLL_INTERVAL_SECS",
+                |c| c.db_poll_interval = std::time::Duration::ZERO,
+            ),
+            ("operator.batch_size", "OPERATOR_BATCH_SIZE", |c| {
+                c.batch_size = 0
+            }),
+            (
+                "operator.retry_max_attempts",
+                "OPERATOR_RETRY_MAX_ATTEMPTS",
+                |c| c.retry_max_attempts = 0,
+            ),
+            (
+                "operator.retry_base_delay_secs",
+                "OPERATOR_RETRY_BASE_DELAY_SECS",
+                |c| c.retry_base_delay = std::time::Duration::ZERO,
+            ),
+            (
+                "operator.channel_buffer_size",
+                "OPERATOR_CHANNEL_BUFFER_SIZE",
+                |c| c.channel_buffer_size = 0,
+            ),
+            (
+                "operator.reconciliation_interval_secs",
+                "OPERATOR_RECONCILIATION_INTERVAL_SECS",
+                |c| c.reconciliation_interval = std::time::Duration::ZERO,
+            ),
+            (
+                "operator.feepayer_monitor_interval_secs",
+                "OPERATOR_FEEPAYER_MONITOR_INTERVAL_SECS",
+                |c| c.feepayer_monitor_interval = std::time::Duration::ZERO,
+            ),
+            (
+                "operator.confirmation_poll_interval_ms",
+                "OPERATOR_CONFIRMATION_POLL_INTERVAL_MS",
+                |c| c.confirmation_poll_interval_ms = 0,
+            ),
+        ];
+        for (key, env, mutate) in cases {
+            for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+                let (common, mut operator) = operator_fixture(role);
+                mutate(&mut operator);
+                let err = validate_operator_startup(&common, &operator)
+                    .expect_err("a zero value must be refused");
+                assert!(err.contains(key), "must name {key}, got: {err}");
+                assert!(err.contains(env), "must name {env}, got: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn operator_startup_requires_a_webhook_for_escrow_only() {
+        for webhook in [None, Some("".to_string()), Some("  ".to_string())] {
+            let (common, mut operator) = operator_fixture(ProgramType::Escrow);
+            operator.reconciliation_webhook_url = webhook;
+            let err = validate_operator_startup(&common, &operator)
+                .expect_err("an escrow operator without an alert sink must not start");
+            assert!(
+                err.contains("operator.reconciliation_webhook_url"),
+                "got: {err}"
+            );
+            assert!(
+                err.contains("OPERATOR_RECONCILIATION_WEBHOOK_URL"),
+                "got: {err}"
+            );
+        }
+        let (common, mut operator) = operator_fixture(ProgramType::Withdraw);
+        operator.reconciliation_webhook_url = None;
+        validate_operator_startup(&common, &operator)
+            .expect("the withdraw role never reads the webhook");
+    }
+
+    #[test]
+    fn operator_startup_requires_a_nonblank_source_rpc_for_both_roles() {
+        for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+            for source in [None, Some("".to_string()), Some(" \t".to_string())] {
+                let (mut common, operator) = operator_fixture(role);
+                common.source_rpc_url = source;
+                let err = validate_operator_startup(&common, &operator)
+                    .expect_err("a blank source rpc cannot serve custody or remints");
+                assert!(err.contains("source_rpc_url"), "got: {err}");
+                assert!(err.contains("COMMON_SOURCE_RPC_URL"), "got: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn operator_startup_requires_the_escrow_instance_for_both_roles() {
+        for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+            let (mut common, operator) = operator_fixture(role);
+            common.escrow_instance_id = None;
+            let err = validate_operator_startup(&common, &operator)
+                .expect_err("every operator is bound to an instance");
+            assert!(err.contains("escrow_instance_id"), "got: {err}");
+        }
     }
 
     // ── operator operational commitment floor ───────────────────────────
